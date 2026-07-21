@@ -49,7 +49,7 @@ impl Default for Calibration {
             width: crate::display::WIDTH,
             height: crate::display::HEIGHT,
             swap_xy: false,
-            invert_x: false,
+            invert_x: true,
             invert_y: true,
         }
     }

@@ -83,7 +83,7 @@ pub fn init<SPI: SpiAnyPins + 'static>(
     let mut delay = Ets;
     let display = Builder::new(ILI9341Rgb565, di)
         .display_size(WIDTH, HEIGHT)
-        .orientation(Orientation::new().rotate(Rotation::Deg0))
+        .orientation(Orientation::new().rotate(Rotation::Deg0).flip_horizontal())
         .invert_colors(ColorInversion::Inverted)
         .init(&mut delay)
         .map_err(|e| anyhow::anyhow!("display init failed: {e:?}"))?;
