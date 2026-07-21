@@ -48,9 +48,9 @@ impl Default for Calibration {
             y_max: 3900,
             width: crate::display::WIDTH,
             height: crate::display::HEIGHT,
-            swap_xy: false,
+            swap_xy: true,
             invert_x: true,
-            invert_y: true,
+            invert_y: false,
         }
     }
 }
