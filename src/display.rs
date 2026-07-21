@@ -49,7 +49,6 @@ impl Backlight {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub fn off(&mut self) -> Result<()> {
         self.pin.set_low().context("failed to disable backlight")?;
         Ok(())

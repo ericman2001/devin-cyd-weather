@@ -18,6 +18,9 @@ pub const REFRESH_INTERVAL_SECS: u64 = 30 * 60; // 30 minutes
 /// How long to wait before retrying after a failed refresh.
 pub const RETRY_INTERVAL_SECS: u64 = 60; // 1 minute
 
+/// How long the backlight stays lit after a screen tap on the weather display.
+pub const BACKLIGHT_ON_SECS: u64 = 60; // 1 minute
+
 /// Open-Meteo forecast API base URL (HTTPS / TLS).
 pub const FORECAST_API_BASE: &str = "https://api.open-meteo.com/v1/forecast";
 
