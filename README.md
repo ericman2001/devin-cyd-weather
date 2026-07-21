@@ -100,6 +100,13 @@ On Windows (PowerShell):
 
 Both scripts wrap `cargo espflash flash --release --monitor`.
 
+### Partition table
+
+The firmware is ~1.35 MB, which does not fit the default 1 MB app partition, so
+this project ships a custom `partitions.csv` (3 MB app, plus NVS) and an
+`espflash.toml` that points `espflash`/`cargo espflash` at it (and sets the
+4 MB flash size). Both are picked up automatically — no extra flags needed.
+
 ## On-screen Wi-Fi setup flow
 
 On first boot (no saved credentials) the device shows the setup UI:

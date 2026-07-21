@@ -1,0 +1,7 @@
+# CYD (ESP32-2432S028R) has 4 MB flash. The default espflash/ESP-IDF layout only
+# reserves 1 MB for the app, which is too small for this Rust firmware (~1.35 MB).
+# This table gives the app 3 MB and keeps an NVS region for saved Wi-Fi config.
+# Name,     Type, SubType,  Offset,    Size,    Flags
+nvs,        data, nvs,      0x9000,    0x6000,
+phy_init,   data, phy,      0xf000,    0x1000,
+factory,    app,  factory,  0x10000,   0x300000,
