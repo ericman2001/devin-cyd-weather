@@ -1,0 +1,8 @@
+# Picked up automatically by both `espflash` and `cargo espflash` (and the
+# cargo runner in .cargo/config.toml). Uses the custom 3 MB app partition so the
+# firmware fits; see partitions.csv.
+[idf_format_args]
+partition_table = "partitions.csv"
+
+[flash_args]
+flash_size = "4mb"
