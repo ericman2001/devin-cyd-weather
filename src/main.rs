@@ -24,8 +24,10 @@ use esp_idf_hal::peripherals::Peripherals;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 
-use crate::config::{ConfigStore, StoredConfig, REFRESH_INTERVAL_SECS, RETRY_INTERVAL_SECS};
-use crate::display::CydDisplay;
+use crate::config::{
+    ConfigStore, StoredConfig, BACKLIGHT_ON_SECS, REFRESH_INTERVAL_SECS, RETRY_INTERVAL_SECS,
+};
+use crate::display::{Backlight, CydDisplay};
 use crate::location::Location;
 use crate::touch::{Calibration, Touch};
 use crate::weather::WeatherData;
@@ -44,7 +46,7 @@ fn main() -> Result<()> {
     let pins = peripherals.pins;
 
     // -- Display (SPI2 / HSPI) ---------------------------------------------
-    let (mut disp, _backlight) = display::init(
+    let (mut disp, mut backlight) = display::init(
         peripherals.spi2,
         pins.gpio14.degrade_input_output(), // SCLK
         pins.gpio13.degrade_input_output(), // MOSI
@@ -108,7 +110,13 @@ fn main() -> Result<()> {
 
     // -- Refresh loop -------------------------------------------------------
     run_refresh_loop(
-        &mut disp, &mut touch, &mut wifi, &mut store, &mut cfg, location,
+        &mut disp,
+        &mut touch,
+        &mut wifi,
+        &mut store,
+        &mut cfg,
+        &mut backlight,
+        location,
     )
 }
 
@@ -185,9 +193,19 @@ fn run_refresh_loop(
     wifi: &mut Wifi,
     store: &mut ConfigStore,
     cfg: &mut StoredConfig,
+    backlight: &mut Backlight,
     location: Location,
 ) -> Result<()> {
     let mut last_good: Option<WeatherData> = None;
+
+    // The config/boot screens are shown with the backlight lit (display::init
+    // turns it on). The weather display is dark by default, so switch the
+    // backlight off exactly once as we transition into the refresh loop.
+    let _ = backlight.off();
+
+    // Remaining time the tap-activated backlight should stay lit, in ms. Kept
+    // across refresh boundaries so the 60s window survives a refresh.
+    let mut remaining_on_ms: u64 = 0;
 
     loop {
         ensure_connected(disp, touch, wifi, store, cfg);
@@ -213,7 +231,47 @@ fn run_refresh_loop(
             }
         };
 
-        sleep_seconds(sleep_secs);
+        wait_with_backlight(touch, backlight, &mut remaining_on_ms, sleep_secs);
+    }
+}
+
+/// Wait for `total` seconds while servicing the tap-activated backlight.
+///
+/// The backlight timer is a *saturating countdown* (`remaining_on_ms`), never
+/// an absolute `activation_ms + threshold` deadline. An absolute deadline can
+/// overflow/wrap if computed near the counter's max value and, in a `--release`
+/// build, Rust wraps silently rather than panicking -- which would leave the
+/// backlight stuck ON (fail-unsafe). Here the only timer arithmetic is
+/// subtraction saturating toward zero, so the fail-safe direction is always
+/// "backlight off": it can never get stuck on. All counters are `u64` ms
+/// (~584M years to overflow) rather than `u32` (~49.7 days, reachable on an
+/// always-on device).
+fn wait_with_backlight(
+    touch: &mut Touch,
+    backlight: &mut Backlight,
+    remaining_on_ms: &mut u64,
+    total_secs: u64,
+) {
+    const CHUNK_MS: u64 = 100;
+    let mut sleep_remaining_ms = total_secs.saturating_mul(1000);
+
+    while sleep_remaining_ms > 0 {
+        // A tap lights the backlight only when it is currently off; a tap while
+        // the window is already active does not reset or extend it.
+        if *remaining_on_ms == 0 && matches!(touch.read(), Ok(Some(_))) && backlight.on().is_ok() {
+            *remaining_on_ms = BACKLIGHT_ON_SECS * 1000;
+        }
+
+        FreeRtos::delay_ms(CHUNK_MS as u32);
+
+        if *remaining_on_ms > 0 {
+            *remaining_on_ms = remaining_on_ms.saturating_sub(CHUNK_MS);
+            if *remaining_on_ms == 0 {
+                let _ = backlight.off();
+            }
+        }
+
+        sleep_remaining_ms = sleep_remaining_ms.saturating_sub(CHUNK_MS);
     }
 }
 
@@ -233,15 +291,5 @@ fn ensure_connected(
     let ssid = cfg.ssid.clone().unwrap_or_default();
     if let Err(e) = wifi.connect(&ssid, cfg.password.as_deref().unwrap_or("")) {
         log::warn!("reconnect failed: {e:#}");
-    }
-}
-
-/// Sleep in short increments so the FreeRTOS watchdog stays happy.
-fn sleep_seconds(total: u64) {
-    let mut remaining = total;
-    while remaining > 0 {
-        let chunk = remaining.min(5);
-        FreeRtos::delay_ms((chunk * 1000) as u32);
-        remaining -= chunk;
     }
 }

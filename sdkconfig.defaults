@@ -17,3 +17,14 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
 # The default HTTP client receive buffer (512 B) is too small for the
 # Open-Meteo forecast payload; bump it so responses fit comfortably.
 CONFIG_ESP_TLS_INSECURE=n
+
+# Power management: let the CPU idle at reduced power during the long waits
+# between refreshes. The firmware already yields via vTaskDelay, but without
+# power management the idle task keeps the CPU at full clock. Enabling PM plus
+# tickless idle lets those existing idle windows actually cut power while the
+# device stays persistently associated to Wi-Fi (no per-cycle reboot).
+CONFIG_PM_ENABLE=y
+# Skip FreeRTOS ticks while idle so the core can enter automatic light sleep.
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+# Automatically configure dynamic frequency scaling min/max at startup.
+CONFIG_PM_DFS_INIT_AUTO=y
