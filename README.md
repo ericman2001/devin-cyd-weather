@@ -173,9 +173,9 @@ weather refresh and the tap-activated backlight behave exactly as before.
 A single decoded 256x256 RGBA radar tile is 256 KB — far more than the ESP32
 can spare while Wi-Fi and TLS are up — so no stage ever holds a whole image:
 
-1. **Download -> SD.** `http::get_to_writer` streams the HTTP body straight
-   into a file on the card through a 512-byte buffer.
-2. **Row-wise decode -> SD.** `radar::decode_to_frame` decodes the PNG one
+1. **Download -> SD.** `radar::download_tiles` / `http::get_to_writer` stream
+   the HTTP body straight into a file on the card through a 512-byte buffer.
+2. **Row-wise decode -> SD.** `radar::decode_tiles` decodes each PNG one
    scanline at a time (incremental `png` reader), crops/downsamples that row to
    the 240x240 view, converts it to Rgb565 and appends it to
    `/sdcard/radar/frame_{i}.rgb565`. Only one source row plus one output row is
@@ -188,11 +188,22 @@ can spare while Wi-Fi and TLS are up — so no stage ever holds a whole image:
 Frame files are raw Rgb565 prefixed with an 8-byte header (`R565`, then width
 and height as little-endian `u16`s).
 
+Download and decode are separate phases on purpose. Inflating a PNG needs a
+32 KB *contiguous* heap block for the zlib window, and no such block exists
+while the Wi-Fi driver and the TLS session hold the large allocations — the
+failed allocation aborts the firmware rather than returning an error. So all
+tiles are downloaded first, the radio is stopped (`Wifi::stop`), the tiles are
+decoded, and the station reconnects. As a backstop the decoder refuses to start
+unless the largest free block is at least `RADAR_DECODE_MIN_BLOCK`, and heap
+stats are logged around both phases (`heap[before download]`, `heap[before
+decode]`, `heap[after decode]`). `sdkconfig.defaults` additionally enables
+mbedTLS dynamic buffers and trims the Wi-Fi buffer pools.
+
 ### Changing the radar source
 
 Open-Meteo does not serve radar imagery, so the tile source is pluggable:
 implement `radar::RadarSource` (one method returning tile URLs, oldest first)
-and pass it to `radar::refresh_frames`. The bundled implementation is
+and pass it to `radar::download_tiles`. The bundled implementation is
 `radar::RainViewer`. Zoom level, colour scheme, frame count, dwell time and the
 refresh interval are constants in `src/config.rs`.
 

@@ -3,9 +3,9 @@
 //! The ESP32 has far too little RAM to hold a decoded radar image (a single
 //! 256x256 RGBA tile is 256 KB), so every stage of this module is streaming:
 //!
-//! 1. [`refresh_frames`] downloads each radar tile straight to the SD card with
+//! 1. [`download_tiles`] downloads each radar tile straight to the SD card with
 //!    [`crate::http::get_to_writer`] (512-byte chunks, nothing buffered).
-//! 2. [`decode_to_frame`] decodes that PNG **one scanline at a time**, converts
+//! 2. [`decode_tiles`] decodes each PNG **one scanline at a time**, converts
 //!    the scanline to Rgb565 while cropping/downsampling it to the display
 //!    region, and appends it to a compact `frame_{i}.rgb565` file. Only one
 //!    source row plus one output row (a few hundred bytes) is ever in RAM.
@@ -15,6 +15,11 @@
 //!
 //! The tile source is pluggable via [`RadarSource`] because Open-Meteo does not
 //! serve radar imagery; [`RainViewer`] is the bundled implementation.
+//!
+//! Download and decode are deliberately *separate* phases: inflating a PNG
+//! needs a 32 KB contiguous zlib window, which does not exist while the Wi-Fi
+//! and TLS stacks are up, so the caller stops the radio between the two (see
+//! `main::refresh_radar`).
 
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -26,8 +31,9 @@ use embedded_graphics::pixelcolor::Rgb565;
 use serde::Deserialize;
 
 use crate::config::{
-    RADAR_COLOR_SCHEME, RADAR_FRAME_COUNT, RADAR_TILE_MAX_BYTES, RADAR_VIEW_HEIGHT,
-    RADAR_VIEW_WIDTH, RADAR_ZOOM, RAINVIEWER_INDEX_API, RAINVIEWER_INDEX_MAX_BYTES,
+    RADAR_COLOR_SCHEME, RADAR_DECODE_MIN_BLOCK, RADAR_FRAME_COUNT, RADAR_TILE_MAX_BYTES,
+    RADAR_VIEW_HEIGHT, RADAR_VIEW_WIDTH, RADAR_ZOOM, RAINVIEWER_INDEX_API,
+    RAINVIEWER_INDEX_MAX_BYTES,
 };
 use crate::display::CydDisplay;
 use crate::storage;
@@ -35,8 +41,9 @@ use crate::storage;
 /// Directory (under the SD mount point) holding the staged radar frames.
 const FRAME_DIR: &str = "radar";
 
-/// File the in-flight tile download is staged in before decoding.
-const TILE_TMP: &str = "tile.tmp";
+/// Cap on the PNG decoder's own allocations, so an oversized image fails with
+/// an error instead of taking the heap (and the board) down.
+const DECODE_LIMIT_BYTES: u32 = 96 * 1024;
 
 /// Magic + dimensions prefixed to every `.rgb565` frame file.
 const MAGIC: [u8; 4] = *b"R565";
@@ -58,6 +65,31 @@ const BLIT_ROWS: usize = 4;
 /// Path of the `i`-th staged frame on the SD card.
 pub fn frame_path(index: usize) -> PathBuf {
     storage::path(&format!("{FRAME_DIR}/frame_{index}.rgb565"))
+}
+
+/// Path of the `i`-th downloaded (still encoded) radar tile.
+fn tile_path(index: usize) -> PathBuf {
+    storage::path(&format!("{FRAME_DIR}/tile_{index}.png"))
+}
+
+/// Log the heap headroom around the memory-hungry stages.
+fn log_heap(stage: &str) {
+    let (free, largest) = heap_stats();
+    log::info!("heap[{stage}]: free={free} B, largest block={largest} B");
+}
+
+/// Total free heap and the largest contiguous internal block, in bytes.
+fn heap_stats() -> (u32, usize) {
+    use esp_idf_svc::sys::{
+        esp_get_free_heap_size, heap_caps_get_largest_free_block, MALLOC_CAP_8BIT,
+        MALLOC_CAP_INTERNAL,
+    };
+    unsafe {
+        (
+            esp_get_free_heap_size(),
+            heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL),
+        )
+    }
 }
 
 /// Number of frames currently staged on the SD card.
@@ -207,12 +239,26 @@ impl Geometry {
 /// The image is processed one scanline at a time; peak RAM is one source row
 /// plus one output row plus the PNG decoder's internal window.
 pub fn decode_to_frame(src: &Path, dst: &Path, geom: &Geometry) -> Result<()> {
+    // Inflating needs a 32 KB contiguous window plus working buffers. Refuse
+    // up front when the heap cannot serve that: a failed allocation inside the
+    // decoder aborts the whole firmware rather than returning an error.
+    let (free, largest) = heap_stats();
+    if largest < RADAR_DECODE_MIN_BLOCK {
+        bail!(
+            "not enough heap to decode a radar frame: largest free block {largest} B \
+             (need {RADAR_DECODE_MIN_BLOCK} B, {free} B free in total)"
+        );
+    }
+
     let file = File::open(src).with_context(|| format!("failed to open {}", src.display()))?;
     let mut decoder = png::Decoder::new(BufReader::with_capacity(1024, file));
     // Expand palette / low-bit-depth images so every row arrives as 8-bit
     // channels; that keeps the per-pixel conversion below trivial.
     decoder.set_transformations(png::Transformations::EXPAND);
     decoder.set_ignore_text_chunk(true);
+    decoder.set_limits(png::Limits {
+        bytes: DECODE_LIMIT_BYTES as usize,
+    });
 
     let mut reader = decoder
         .read_info()
@@ -330,44 +376,70 @@ fn rgb565(r: u8, g: u8, b: u8) -> u16 {
 // Orchestration: fetch N frames onto the SD card
 // ---------------------------------------------------------------------------
 
-/// Download and stage up to [`RADAR_FRAME_COUNT`] radar frames for `lat`/`lon`.
-///
-/// Returns the number of frames successfully staged as
-/// `/sdcard/radar/frame_{i}.rgb565`.
-pub fn refresh_frames(source: &dyn RadarSource, lat: f64, lon: f64) -> Result<usize> {
+/// Phase 1 (network): download up to [`RADAR_FRAME_COUNT`] radar tiles for
+/// `lat`/`lon` onto the SD card. Returns how many tiles were staged.
+pub fn download_tiles(source: &dyn RadarSource, lat: f64, lon: f64) -> Result<usize> {
     storage::ensure_dir(FRAME_DIR)?;
+    log_heap("before download");
+
     let urls = source.frame_urls(lat, lon, RADAR_FRAME_COUNT)?;
-    let geom = Geometry::centered_on(lat, lon, RADAR_ZOOM);
-    let tmp = storage::path(&format!("{FRAME_DIR}/{TILE_TMP}"));
 
     let mut staged = 0usize;
     for url in urls.iter() {
-        match stage_frame(url, &tmp, &frame_path(staged), &geom) {
+        let path = tile_path(staged);
+        match download_tile(url, &path) {
             Ok(()) => staged += 1,
-            Err(e) => log::warn!("radar frame {url} failed: {e:#}"),
+            Err(e) => {
+                log::warn!("radar tile {url} failed: {e:#}");
+                let _ = std::fs::remove_file(&path);
+            }
         }
     }
-    let _ = std::fs::remove_file(&tmp);
+
+    if staged == 0 {
+        bail!("no radar tiles could be downloaded");
+    }
+    log::info!("downloaded {staged} radar tiles to the SD card");
+    Ok(staged)
+}
+
+fn download_tile(url: &str, path: &Path) -> Result<()> {
+    let mut file =
+        File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
+    crate::http::get_to_writer(url, &mut file, RADAR_TILE_MAX_BYTES)?;
+    Ok(())
+}
+
+/// Phase 2 (no network): decode the `count` staged tiles into compact
+/// `frame_{i}.rgb565` files and delete the encoded originals.
+///
+/// Call this with the Wi-Fi driver stopped: the decoder needs a 32 KB
+/// contiguous block that the radio's buffers otherwise occupy.
+pub fn decode_tiles(count: usize, lat: f64, lon: f64) -> Result<usize> {
+    log_heap("before decode");
+    let geom = Geometry::centered_on(lat, lon, RADAR_ZOOM);
+
+    let mut staged = 0usize;
+    for i in 0..count {
+        let tile = tile_path(i);
+        match decode_to_frame(&tile, &frame_path(staged), &geom) {
+            Ok(()) => staged += 1,
+            Err(e) => log::warn!("decoding {} failed: {e:#}", tile.display()),
+        }
+        let _ = std::fs::remove_file(&tile);
+    }
 
     // Drop any stale frames left over from a longer previous run.
     for i in staged..RADAR_FRAME_COUNT {
         let _ = std::fs::remove_file(frame_path(i));
     }
 
+    log_heap("after decode");
     if staged == 0 {
-        bail!("no radar frames could be staged");
+        bail!("no radar frames could be decoded");
     }
     log::info!("staged {staged} radar frames on the SD card");
     Ok(staged)
-}
-
-fn stage_frame(url: &str, tmp: &Path, dst: &Path, geom: &Geometry) -> Result<()> {
-    {
-        let mut file =
-            File::create(tmp).with_context(|| format!("failed to create {}", tmp.display()))?;
-        crate::http::get_to_writer(url, &mut file, RADAR_TILE_MAX_BYTES)?;
-    }
-    decode_to_frame(tmp, dst, geom)
 }
 
 // ---------------------------------------------------------------------------

@@ -98,6 +98,24 @@ impl Wifi {
         Ok(())
     }
 
+    /// Stop the Wi-Fi driver, releasing the tens of kilobytes of heap it holds.
+    ///
+    /// The radar decoder needs a 32 KB contiguous block for its zlib window,
+    /// which is not available while the station is up; the caller stops the
+    /// radio for the decode and brings it back with [`Wifi::start`].
+    pub fn stop(&mut self) -> Result<()> {
+        self.inner.stop().context("failed to stop wifi")?;
+        log::info!("wifi stopped to free heap");
+        Ok(())
+    }
+
+    /// Restart the Wi-Fi driver after a [`Wifi::stop`]. The saved
+    /// configuration is retained, but the station still has to reconnect.
+    pub fn start(&mut self) -> Result<()> {
+        self.inner.start().context("failed to restart wifi")?;
+        Ok(())
+    }
+
     /// Return the acquired IPv4 address as a string, when connected.
     pub fn ip_info(&self) -> Result<String> {
         let info = self

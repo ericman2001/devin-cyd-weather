@@ -149,15 +149,21 @@ fn main() -> Result<()> {
     let location = resolve_location(&mut disp, &cfg);
 
     // -- Refresh loop -------------------------------------------------------
-    run_refresh_loop(
-        &mut disp,
-        &mut touch,
-        &mut wifi,
-        &mut cfg,
-        &mut backlight,
-        location,
-        sd_ready,
-    )
+    let mut devices = Devices {
+        disp: &mut disp,
+        touch: &mut touch,
+        backlight: &mut backlight,
+        wifi: &mut wifi,
+    };
+    run_refresh_loop(&mut devices, &mut cfg, location, sd_ready)
+}
+
+/// The peripherals the refresh loop and the screens share.
+struct Devices<'a> {
+    disp: &'a mut CydDisplay,
+    touch: &'a mut Touch,
+    backlight: &'a mut Backlight,
+    wifi: &'a mut Wifi,
 }
 
 /// Poll the touch panel briefly at boot; returns true if held for ~1.5s.
@@ -277,11 +283,8 @@ impl RadarState {
 }
 
 fn run_refresh_loop(
-    disp: &mut CydDisplay,
-    touch: &mut Touch,
-    wifi: &mut Wifi,
+    dev: &mut Devices,
     cfg: &mut StoredConfig,
-    backlight: &mut Backlight,
     location: Location,
     sd_ready: bool,
 ) -> Result<()> {
@@ -290,7 +293,7 @@ fn run_refresh_loop(
     // The config/boot screens are shown with the backlight lit (display::init
     // turns it on). The weather display is dark by default, so switch the
     // backlight off exactly once as we transition into the refresh loop.
-    let _ = backlight.off();
+    let _ = dev.backlight.off();
 
     let mut state = AppState {
         screen: Screen::Weather,
@@ -307,29 +310,28 @@ fn run_refresh_loop(
     };
 
     loop {
-        ensure_connected(disp, wifi, cfg);
+        ensure_connected(dev.disp, dev.wifi, cfg);
 
         let sleep_secs = match weather::fetch(location.latitude, location.longitude) {
             Ok(data) => {
                 last_good = Some(data);
                 if state.screen == Screen::Weather {
-                    draw_weather_screen(disp, last_good.as_ref(), &location, false);
+                    draw_weather_screen(dev.disp, last_good.as_ref(), &location, false);
                 }
                 REFRESH_INTERVAL_SECS
             }
             Err(e) => {
                 log::warn!("weather fetch failed: {e:#}");
                 if state.screen == Screen::Weather {
-                    draw_weather_screen(disp, last_good.as_ref(), &location, true);
+                    draw_weather_screen(dev.disp, last_good.as_ref(), &location, true);
                 }
                 RETRY_INTERVAL_SECS
             }
         };
 
         wait_with_backlight(
-            disp,
-            touch,
-            backlight,
+            dev,
+            cfg,
             &mut state,
             last_good.as_ref(),
             &location,
@@ -365,20 +367,24 @@ fn draw_weather_screen(
 
 /// Enter the radar screen: (re-)stage the frames if they are missing or stale,
 /// then show the first one.
-fn enter_radar_screen(disp: &mut CydDisplay, state: &mut AppState, location: &Location) {
-    ui::draw_radar_chrome(disp, "Radar", "Loading...").ok();
-    ui::draw_toolbar(disp, Screen::Radar).ok();
+fn enter_radar_screen(
+    dev: &mut Devices,
+    cfg: &mut StoredConfig,
+    state: &mut AppState,
+    location: &Location,
+) {
+    ui::draw_radar_chrome(dev.disp, "Radar", "Loading...").ok();
+    ui::draw_toolbar(dev.disp, Screen::Radar).ok();
 
     if !state.radar.sd_ready {
-        ui::draw_radar_status(disp, "No SD card - radar unavailable").ok();
+        ui::draw_radar_status(dev.disp, "No SD card - radar unavailable").ok();
         return;
     }
 
     if state.radar.is_stale() {
-        match radar::refresh_frames(&state.radar.source, location.latitude, location.longitude) {
+        match refresh_radar(dev, cfg, state, location) {
             Ok(frames) => {
                 state.radar.frames = frames;
-                state.radar.index = 0;
                 state.radar.staged_at = Some(Instant::now());
             }
             Err(e) => {
@@ -389,13 +395,47 @@ fn enter_radar_screen(disp: &mut CydDisplay, state: &mut AppState, location: &Lo
     }
 
     if state.radar.frames == 0 {
-        ui::draw_radar_status(disp, "Radar unavailable").ok();
+        ui::draw_radar_status(dev.disp, "Radar unavailable").ok();
         return;
     }
 
     state.radar.index = 0;
     state.radar.dwell_ms = 0;
-    show_radar_frame(disp, state);
+    show_radar_frame(dev.disp, state);
+}
+
+/// Download the radar tiles, then decode them **with the radio stopped**.
+///
+/// Inflating a PNG needs a 32 KB contiguous heap block; the Wi-Fi driver and
+/// the TLS session hold enough of the heap that the allocation fails (and a
+/// failed allocation aborts the firmware rather than returning an error), so
+/// the two phases never overlap.
+fn refresh_radar(
+    dev: &mut Devices,
+    cfg: &mut StoredConfig,
+    state: &mut AppState,
+    location: &Location,
+) -> Result<usize> {
+    let tiles = radar::download_tiles(&state.radar.source, location.latitude, location.longitude)?;
+
+    ui::draw_radar_status(dev.disp, "Decoding...").ok();
+    let stopped = match dev.wifi.stop() {
+        Ok(()) => true,
+        Err(e) => {
+            log::warn!("could not stop wifi before decoding: {e:#}");
+            false
+        }
+    };
+
+    let decoded = radar::decode_tiles(tiles, location.latitude, location.longitude);
+
+    if stopped {
+        match dev.wifi.start() {
+            Ok(()) => ensure_connected(dev.disp, dev.wifi, cfg),
+            Err(e) => log::warn!("could not restart wifi after decoding: {e:#}"),
+        }
+    }
+    decoded
 }
 
 /// Stream the current radar frame from the SD card onto the panel.
@@ -424,9 +464,8 @@ fn show_radar_frame(disp: &mut CydDisplay, state: &mut AppState) {
 /// (~584M years to overflow) rather than `u32` (~49.7 days, reachable on an
 /// always-on device).
 fn wait_with_backlight(
-    disp: &mut CydDisplay,
-    touch: &mut Touch,
-    backlight: &mut Backlight,
+    dev: &mut Devices,
+    cfg: &mut StoredConfig,
     state: &mut AppState,
     last_good: Option<&WeatherData>,
     location: &Location,
@@ -436,7 +475,7 @@ fn wait_with_backlight(
     let mut sleep_remaining_ms = total_secs.saturating_mul(1000);
 
     while sleep_remaining_ms > 0 {
-        let point = touch.read().unwrap_or_default();
+        let point = dev.touch.read().unwrap_or_default();
         // Only the press edge counts, so a resting finger cannot flip screens
         // repeatedly.
         let tap = match (point, state.touch_down) {
@@ -448,15 +487,17 @@ fn wait_with_backlight(
         if let Some(p) = tap {
             if state.remaining_on_ms == 0 {
                 // The screen is dark: the first tap only wakes it.
-                if backlight.on().is_ok() {
+                if dev.backlight.on().is_ok() {
                     state.remaining_on_ms = BACKLIGHT_ON_SECS * 1000;
                 }
             } else if let Some(target) = ui::toolbar_hit(p) {
                 if target != state.screen {
                     state.screen = target;
                     match target {
-                        Screen::Weather => draw_weather_screen(disp, last_good, location, false),
-                        Screen::Radar => enter_radar_screen(disp, state, location),
+                        Screen::Weather => {
+                            draw_weather_screen(dev.disp, last_good, location, false)
+                        }
+                        Screen::Radar => enter_radar_screen(dev, cfg, state, location),
                     }
                 }
             }
@@ -467,7 +508,7 @@ fn wait_with_backlight(
             state.radar.dwell_ms = state.radar.dwell_ms.saturating_sub(CHUNK_MS);
             if state.radar.dwell_ms == 0 {
                 state.radar.index = (state.radar.index + 1) % state.radar.frames;
-                show_radar_frame(disp, state);
+                show_radar_frame(dev.disp, state);
                 state.radar.dwell_ms = RADAR_FRAME_MS;
             }
         }
@@ -477,7 +518,7 @@ fn wait_with_backlight(
         if state.remaining_on_ms > 0 {
             state.remaining_on_ms = state.remaining_on_ms.saturating_sub(CHUNK_MS);
             if state.remaining_on_ms == 0 {
-                let _ = backlight.off();
+                let _ = dev.backlight.off();
             }
         }
 
