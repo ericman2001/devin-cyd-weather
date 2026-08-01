@@ -12,11 +12,16 @@ Hardware reference:
 ## Features
 
 - On-screen, **touch-driven Wi-Fi setup** — scan for networks, pick one, and
-  type the password on an on-screen QWERTY keyboard. Supports WPA2/WPA3-hybrid
-  networks (connects with `WPA2WPA3Personal`).
+  type the password on an on-screen QWERTY keyboard.
+- Selectable **Wi-Fi security type** during setup — *Auto* (WPA2/WPA3, the
+  default), **WPA/WPA2 Personal** (fixes older APs that timed out under the
+  WPA2/WPA3 default), WPA2 Personal, WPA2/WPA3 Personal, or Open.
+- Toggleable **serial/USB debug logging** — enable or disable verbose
+  connect-path logging during setup; the choice is persisted.
 - Optional **manual latitude/longitude** override (entered via an on-screen
   numeric keypad) in case IP geolocation is inaccurate.
-- Credentials + location persisted in **NVS flash**, so setup only happens once.
+- Credentials, security type, debug-logging preference, and location persisted
+  in **NVS flash**, so setup only happens once.
 - **IP geolocation** (via `ip-api.com`) when no manual location is set.
 - Current conditions + **4-day forecast** from **Open-Meteo**, plus **US AQI**
   from the Open-Meteo air-quality API, in American customary units
@@ -115,7 +120,14 @@ On first boot (no saved credentials) the device shows the setup UI:
    page, or *Manual* to type an SSID by hand).
 2. **Password** — type it on the on-screen QWERTY keyboard (`Sh` toggles case,
    `<-` backspaces, `OK` confirms).
-3. **Manual location?** — choose *Yes* to enter latitude/longitude on a numeric
+3. **Wi-Fi security** — tap the security type for your network: *Auto*
+   (WPA2/WPA3, works for most), **WPA/WPA2 Personal** (older/mixed-mode APs
+   that would otherwise time out), *WPA2 Personal*, *WPA2/WPA3 Personal*, or
+   *Open*.
+4. **Serial debug** — choose *Enable* or *Disable* to turn USB serial debug
+   logging on or off (helpful when diagnosing Wi-Fi connection issues over the
+   USB monitor).
+5. **Manual location?** — choose *Yes* to enter latitude/longitude on a numeric
    keypad, or *No* to use automatic IP geolocation.
 
 The settings are saved to NVS and the device connects and starts displaying
