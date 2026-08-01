@@ -34,6 +34,42 @@ pub const GEOLOCATION_API: &str = "http://ip-api.com/json/";
 /// Number of forecast days to request / render.
 pub const FORECAST_DAYS: usize = 4;
 
+// ---------------------------------------------------------------------------
+// Radar slideshow
+// ---------------------------------------------------------------------------
+
+/// RainViewer frame index: lists the available past + nowcast radar tile paths.
+///
+/// Open-Meteo has no radar imagery, so the radar source is deliberately
+/// separate (and pluggable, see `radar::RadarSource`).
+pub const RAINVIEWER_INDEX_API: &str = "https://api.rainviewer.com/public/weather-maps.json";
+
+/// Cap on the RainViewer index JSON we buffer in RAM.
+pub const RAINVIEWER_INDEX_MAX_BYTES: usize = 16 * 1024;
+
+/// Cap on a single downloaded radar tile (streamed to the SD card, never RAM).
+pub const RADAR_TILE_MAX_BYTES: usize = 256 * 1024;
+
+/// Slippy-map zoom level of the radar tiles (~150 km across at zoom 6).
+pub const RADAR_ZOOM: u8 = 6;
+
+/// RainViewer colour scheme id (4 = "Universal Blue").
+pub const RADAR_COLOR_SCHEME: u8 = 4;
+
+/// Number of radar frames staged on the SD card and animated.
+pub const RADAR_FRAME_COUNT: usize = 6;
+
+/// Size of the radar view area on the panel, in pixels.
+pub const RADAR_VIEW_WIDTH: u16 = 240;
+pub const RADAR_VIEW_HEIGHT: u16 = 240;
+
+/// Dwell time per radar frame during the slideshow.
+pub const RADAR_FRAME_MS: u64 = 600;
+
+/// How often the staged radar frames are re-downloaded while the radar screen
+/// is in use.
+pub const RADAR_REFRESH_SECS: u64 = 10 * 60;
+
 // NVS namespace + key names.
 const NVS_NAMESPACE: &str = "cydweather";
 const KEY_SSID: &str = "ssid";

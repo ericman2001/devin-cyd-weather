@@ -51,5 +51,9 @@ anyhow = "1.0.104"
 # Fixed-capacity collections used on the heap-constrained device
 heapless = "0.8.0"
 
+# Incremental (scanline-at-a-time) PNG decoding for the radar frames, so a full
+# decoded image never has to fit in RAM.
+png = "0.17.16"
+
 [build-dependencies]
 embuild = "0.33.2"

@@ -13,6 +13,7 @@ use embedded_graphics::primitives::{Circle, Line, PrimitiveStyle, Rectangle, Tri
 use embedded_graphics::text::{Alignment, Baseline, Text, TextStyleBuilder};
 
 use crate::display::{HEIGHT, WIDTH};
+use crate::touch::TouchPoint;
 use crate::weather::{aqi_category, uv_category, WeatherData, WeatherIcon};
 
 // -- Palette ----------------------------------------------------------------
@@ -254,6 +255,128 @@ where
         Alignment::Center,
     )?;
     Ok(())
+}
+
+// -- Screens + bottom toolbar ------------------------------------------------
+
+/// Height of the bottom navigation toolbar.
+pub const TOOLBAR_HEIGHT: i32 = 28;
+
+/// Y coordinate of the toolbar's top edge.
+pub const TOOLBAR_TOP: i32 = HEIGHT as i32 - TOOLBAR_HEIGHT;
+
+/// Top of the radar image area on the radar screen.
+pub const RADAR_VIEW_TOP: i32 = 24;
+
+/// The screen currently shown on the panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Screen {
+    #[default]
+    Weather,
+    Radar,
+}
+
+impl Screen {
+    fn label(self) -> &'static str {
+        match self {
+            Screen::Weather => "Weather",
+            Screen::Radar => "Radar",
+        }
+    }
+}
+
+/// Draw the bottom toolbar, highlighting the active screen's button.
+pub fn draw_toolbar<D>(display: &mut D, active: Screen) -> R<D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    let half = WIDTH as i32 / 2;
+    for (i, screen) in [Screen::Weather, Screen::Radar].into_iter().enumerate() {
+        let x = i as i32 * half;
+        let selected = screen == active;
+        Rectangle::new(
+            Point::new(x, TOOLBAR_TOP),
+            Size::new(half as u32, TOOLBAR_HEIGHT as u32),
+        )
+        .into_styled(PrimitiveStyle::with_fill(if selected {
+            ACCENT
+        } else {
+            BG
+        }))
+        .draw(display)?;
+        Rectangle::new(
+            Point::new(x, TOOLBAR_TOP),
+            Size::new(half as u32, TOOLBAR_HEIGHT as u32),
+        )
+        .into_styled(PrimitiveStyle::with_stroke(MUTED, 1))
+        .draw(display)?;
+        draw_text(
+            display,
+            screen.label(),
+            x + half / 2,
+            TOOLBAR_TOP + 9,
+            &FONT_6X13,
+            if selected { Rgb565::BLACK } else { FG },
+            Alignment::Center,
+        )?;
+    }
+    Ok(())
+}
+
+/// Map a touch point to the toolbar button it hit, if any.
+pub fn toolbar_hit(point: TouchPoint) -> Option<Screen> {
+    if point.y < TOOLBAR_TOP || point.y >= HEIGHT as i32 {
+        return None;
+    }
+    if point.x < WIDTH as i32 / 2 {
+        Some(Screen::Weather)
+    } else {
+        Some(Screen::Radar)
+    }
+}
+
+/// Draw the static parts of the radar screen (title + status line area).
+///
+/// The radar frames themselves are streamed straight from the SD card into the
+/// panel by `radar::blit_frame`, bypassing `embedded-graphics` entirely.
+pub fn draw_radar_chrome<D>(display: &mut D, title: &str, status: &str) -> R<D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    clear(display)?;
+    draw_text(
+        display,
+        title,
+        WIDTH as i32 / 2,
+        4,
+        &FONT_6X13,
+        ACCENT,
+        Alignment::Center,
+    )?;
+    draw_radar_status(display, status)
+}
+
+/// Update just the status line below the radar view.
+pub fn draw_radar_status<D>(display: &mut D, status: &str) -> R<D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    let top = TOOLBAR_TOP - 20;
+    Rectangle::new(
+        Point::new(0, top),
+        Size::new(WIDTH as u32, (TOOLBAR_TOP - top) as u32),
+    )
+    .into_styled(PrimitiveStyle::with_fill(BG))
+    .draw(display)?;
+    draw_text(
+        display,
+        status,
+        WIDTH as i32 / 2,
+        top + 4,
+        &FONT_6X10,
+        MUTED,
+        Alignment::Center,
+    )
 }
 
 /// Render an error banner over the (possibly stale) weather screen.

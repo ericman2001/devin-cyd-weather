@@ -30,6 +30,8 @@ Hardware reference:
   and graceful error/status screens.
 - Refreshes every **30 minutes**, keeping the last good reading on transient
   network failures and showing a retry banner.
+- **Animated radar slideshow** on a second screen, reachable from the bottom
+  toolbar, built on a fully streaming SD-card pipeline (see below).
 
 ## Hardware pin mapping (ESP32-2432S028R)
 
@@ -42,11 +44,23 @@ Hardware reference:
 | TFT DC          | 2    | SPI2           |
 | TFT backlight   | 21   | GPIO out       |
 | TFT reset       | —    | tied to EN     |
-| Touch T_CLK     | 25   | SPI3 (touch)   |
-| Touch T_MOSI    | 32   | SPI3           |
-| Touch T_MISO    | 39   | SPI3 (in only) |
-| Touch T_CS      | 33   | SPI3           |
+| Touch T_CLK     | 25   | software SPI   |
+| Touch T_MOSI    | 32   | software SPI   |
+| Touch T_MISO    | 39   | software SPI (in only) |
+| Touch T_CS      | 33   | software SPI   |
 | Touch T_IRQ     | 36   | GPIO in only   |
+| SD SCK          | 18   | SPI3 (SD card) |
+| SD MOSI         | 23   | SPI3           |
+| SD MISO         | 19   | SPI3           |
+| SD CS           | 5    | SPI3           |
+
+> **Three SPI devices, two SPI hosts.** The ESP32 exposes only SPI2 and SPI3
+> for general use, and the CYD has three SPI peripherals. The display keeps
+> SPI2 and the SD card takes SPI3, so the XPT2046 touch controller is driven by
+> a **bit-banged mode-0 SPI** in `src/touch.rs` (it tops out at 2 MHz anyway,
+> so nothing is lost). The SD pins above are the standard CYD micro-SD slot on
+> the back of the board — verify them against your board revision before
+> concluding the radar screen is broken.
 
 > **CYD variant note:** the two-USB "CYD2USB" revision ships an **ST7789**
 > controller with the backlight on **GPIO 27** (not 21). If your board shows a
@@ -140,6 +154,48 @@ credentials/location are erased and the setup UI is shown again. If a saved
 network later fails to connect, the device also drops back into setup and waits
 for a tap.
 
+## Radar slideshow (SD card required)
+
+The second screen animates recent + nowcast precipitation radar for your
+location. It needs a **FAT32-formatted micro-SD card** in the slot on the back
+of the board; without one the firmware logs a warning, keeps working, and the
+radar screen reports that no card is present. The firmware never formats the
+card, so existing data is safe.
+
+Tap the bottom toolbar to switch between **Weather** and **Radar**. (When the
+backlight is off, the first tap only wakes the screen.) On the radar screen the
+staged frames cycle every 600 ms and are re-downloaded when older than 10
+minutes; the animation pauses whenever the backlight is off. The 30-minute
+weather refresh and the tap-activated backlight behave exactly as before.
+
+### Memory-conscious streaming pipeline
+
+A single decoded 256x256 RGBA radar tile is 256 KB — far more than the ESP32
+can spare while Wi-Fi and TLS are up — so no stage ever holds a whole image:
+
+1. **Download -> SD.** `http::get_to_writer` streams the HTTP body straight
+   into a file on the card through a 512-byte buffer.
+2. **Row-wise decode -> SD.** `radar::decode_to_frame` decodes the PNG one
+   scanline at a time (incremental `png` reader), crops/downsamples that row to
+   the 240x240 view, converts it to Rgb565 and appends it to
+   `/sdcard/radar/frame_{i}.rgb565`. Only one source row plus one output row is
+   in RAM.
+3. **Stream -> display.** `radar::blit_frame` reads a staged frame back in
+   4-row bands and pushes each band into a `mipidsi` address window, so the
+   panel is fed from the SD card with no framebuffer. This path bypasses the
+   `embedded-graphics` vector rendering used by `src/ui.rs`.
+
+Frame files are raw Rgb565 prefixed with an 8-byte header (`R565`, then width
+and height as little-endian `u16`s).
+
+### Changing the radar source
+
+Open-Meteo does not serve radar imagery, so the tile source is pluggable:
+implement `radar::RadarSource` (one method returning tile URLs, oldest first)
+and pass it to `radar::refresh_frames`. The bundled implementation is
+`radar::RainViewer`. Zoom level, colour scheme, frame count, dwell time and the
+refresh interval are constants in `src/config.rs`.
+
 ## Touch calibration
 
 Raw XPT2046 ADC values are mapped to screen coordinates by `Calibration` in
@@ -154,13 +210,15 @@ flags there.
 | `src/main.rs` | Boot flow + 30-minute refresh loop |
 | `src/config.rs` | NVS-backed config + tunable constants |
 | `src/display.rs` | ILI9341 (`mipidsi`) SPI init + backlight |
-| `src/touch.rs` | XPT2046 SPI reader + calibration |
+| `src/touch.rs` | XPT2046 bit-banged SPI reader + calibration |
+| `src/storage.rs` | SD card (SDSPI) + FAT filesystem mounted at `/sdcard` |
+| `src/radar.rs` | Radar tile sources, row-wise decoder, frame streaming |
 | `src/wifi.rs` | Station scan/connect |
 | `src/provisioning.rs` | Touch setup UI (list, keyboard, keypad) |
 | `src/location.rs` | IP geolocation |
 | `src/weather.rs` | Open-Meteo forecast + AQI, WMO code mapping |
-| `src/ui.rs` | Weather dashboard + status/error rendering |
-| `src/http.rs` | HTTPS GET helper (mbedTLS cert bundle) |
+| `src/ui.rs` | Weather dashboard, radar chrome, toolbar, status/error rendering |
+| `src/http.rs` | HTTPS GET helpers (buffered + streaming, mbedTLS cert bundle) |
 
 ## License
 
