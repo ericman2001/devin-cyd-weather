@@ -72,6 +72,9 @@ fn main() -> Result<()> {
     // -- Configuration ------------------------------------------------------
     let mut store = ConfigStore::new(nvs_part.clone())?;
     let mut cfg = store.load().unwrap_or_default();
+    // `initialize_default()` above runs before config is available, so re-apply
+    // the desired verbosity now that we know the user's preference.
+    apply_log_level(cfg.serial_debug);
 
     // Touch-and-hold at boot forces re-provisioning.
     if touch_held_at_boot(&mut touch) {
@@ -85,22 +88,32 @@ fn main() -> Result<()> {
 
     if !cfg.has_wifi() {
         cfg = provision(&mut disp, &mut touch, &mut wifi, &mut store)?;
+        apply_log_level(cfg.serial_debug);
     }
 
     // Connect, falling back to provisioning if the saved credentials fail.
     loop {
         let ssid = cfg.ssid.clone().unwrap_or_default();
+        log::info!(
+            "attempting Wi-Fi connect to {ssid:?} using auth {}",
+            cfg.auth_method.label()
+        );
         ui::draw_status(&mut disp, "Connecting", &ssid).ok();
-        match wifi.connect(&ssid, cfg.password.as_deref().unwrap_or("")) {
+        match wifi.connect(
+            &ssid,
+            cfg.password.as_deref().unwrap_or(""),
+            cfg.auth_method,
+        ) {
             Ok(()) => {
                 log::info!("connected, ip = {:?}", wifi.ip_info());
                 break;
             }
             Err(e) => {
-                log::warn!("connect failed: {e:#}");
+                log::warn!("connect to {ssid:?} failed: {e:#}");
                 ui::draw_status(&mut disp, "Wi-Fi failed", "Tap to reconfigure").ok();
                 wait_for_touch(&mut touch);
                 cfg = provision(&mut disp, &mut touch, &mut wifi, &mut store)?;
+                apply_log_level(cfg.serial_debug);
             }
         }
     }
@@ -133,6 +146,22 @@ fn touch_held_at_boot(touch: &mut Touch) -> bool {
         FreeRtos::delay_ms(STEP_MS);
     }
     held >= REQUIRED_MS
+}
+
+/// Apply the serial/USB debug logging preference by adjusting the global log
+/// max level. When enabled we allow `Debug` and below; when disabled logging
+/// is turned `Off`.
+fn apply_log_level(serial_debug: bool) {
+    let level = if serial_debug {
+        log::LevelFilter::Debug
+    } else {
+        log::LevelFilter::Off
+    };
+    log::set_max_level(level);
+    log::info!(
+        "serial debug logging {} (max level {level})",
+        if serial_debug { "enabled" } else { "disabled" }
+    );
 }
 
 fn wait_for_touch(touch: &mut Touch) {
@@ -289,7 +318,16 @@ fn ensure_connected(
     log::info!("link down, reconnecting");
     ui::draw_status(disp, "Reconnecting", "Wi-Fi link lost").ok();
     let ssid = cfg.ssid.clone().unwrap_or_default();
-    if let Err(e) = wifi.connect(&ssid, cfg.password.as_deref().unwrap_or("")) {
-        log::warn!("reconnect failed: {e:#}");
+    log::info!(
+        "reconnecting to {ssid:?} using auth {}",
+        cfg.auth_method.label()
+    );
+    match wifi.connect(
+        &ssid,
+        cfg.password.as_deref().unwrap_or(""),
+        cfg.auth_method,
+    ) {
+        Ok(()) => log::info!("reconnected to {ssid:?}"),
+        Err(e) => log::warn!("reconnect failed: {e:#}"),
     }
 }

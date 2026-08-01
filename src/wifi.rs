@@ -8,6 +8,8 @@ use esp_idf_svc::wifi::{
     AuthMethod, BlockingWifi, ClientConfiguration, Configuration as WifiConfiguration, EspWifi,
 };
 
+use crate::config::WifiAuth;
+
 /// Owns the Wi-Fi driver for the lifetime of the program.
 pub struct Wifi {
     inner: BlockingWifi<EspWifi<'static>>,
@@ -34,6 +36,7 @@ impl Wifi {
     /// descending signal strength.
     pub fn scan_ssids(&mut self) -> Result<Vec<String>> {
         let mut aps = self.inner.scan().context("wifi scan failed")?;
+        log::info!("wifi scan found {} access point(s)", aps.len());
         aps.sort_by_key(|ap| core::cmp::Reverse(ap.signal_strength));
         let mut seen = std::collections::HashSet::new();
         let mut ssids = Vec::new();
@@ -43,18 +46,28 @@ impl Wifi {
                 ssids.push(ssid);
             }
         }
+        log::debug!("wifi scan yielded {} unique SSID(s)", ssids.len());
         Ok(ssids)
     }
 
     /// Connect to the given network and wait until an IP is acquired.
     ///
-    /// `auth_method` defaults to WPA2/WPA3 so hybrid networks negotiate cleanly.
-    pub fn connect(&mut self, ssid: &str, password: &str) -> Result<()> {
-        let auth_method = if password.is_empty() {
+    /// The `auth` argument selects the security type chosen during
+    /// provisioning. When the user picked [`WifiAuth::Open`] or
+    /// [`WifiAuth::Auto`] and left the password empty, [`AuthMethod::None`] is
+    /// used; otherwise the chosen method is applied verbatim.
+    pub fn connect(&mut self, ssid: &str, password: &str, auth: WifiAuth) -> Result<()> {
+        let auth_method = if password.is_empty() && matches!(auth, WifiAuth::Open | WifiAuth::Auto)
+        {
             AuthMethod::None
         } else {
-            AuthMethod::WPA2WPA3Personal
+            auth.to_auth_method()
         };
+
+        log::info!(
+            "wifi connect: ssid={ssid:?} auth={} -> {auth_method:?}",
+            auth.label()
+        );
 
         let client = ClientConfiguration {
             ssid: ssid
@@ -67,13 +80,21 @@ impl Wifi {
             ..Default::default()
         };
 
+        log::debug!("wifi: setting client configuration");
         self.inner
             .set_configuration(&WifiConfiguration::Client(client))
             .context("failed to set client configuration")?;
+        log::debug!("wifi: calling connect()");
         self.inner.connect().context("wifi connect failed")?;
-        self.inner
-            .wait_netif_up()
-            .context("timed out waiting for network interface")?;
+        log::debug!("wifi: waiting for netif up");
+        if let Err(e) = self.inner.wait_netif_up() {
+            log::warn!("wifi: timed out waiting for netif up: {e:#}");
+            return Err(e).context("timed out waiting for network interface");
+        }
+        match self.ip_info() {
+            Ok(ip) => log::info!("wifi connected, acquired IP {ip}"),
+            Err(e) => log::warn!("wifi connected but failed to read IP: {e:#}"),
+        }
         Ok(())
     }
 
@@ -89,6 +110,8 @@ impl Wifi {
     }
 
     pub fn is_connected(&self) -> bool {
-        self.inner.is_connected().unwrap_or(false)
+        let connected = self.inner.is_connected().unwrap_or(false);
+        log::debug!("wifi is_connected -> {connected}");
+        connected
     }
 }

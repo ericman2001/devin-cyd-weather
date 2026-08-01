@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result};
 use esp_idf_svc::nvs::{EspNvs, EspNvsPartition, NvsDefault};
+use esp_idf_svc::wifi::AuthMethod;
 
 // ---------------------------------------------------------------------------
 // Tunable constants
@@ -37,21 +38,118 @@ pub const FORECAST_DAYS: usize = 4;
 const NVS_NAMESPACE: &str = "cydweather";
 const KEY_SSID: &str = "ssid";
 const KEY_PASSWORD: &str = "password";
+const KEY_AUTH: &str = "auth";
+const KEY_DEBUG: &str = "debug";
 const KEY_LAT: &str = "lat";
 const KEY_LON: &str = "lon";
+
+// ---------------------------------------------------------------------------
+// Wi-Fi security / authentication method
+// ---------------------------------------------------------------------------
+
+/// User-selectable Wi-Fi security type chosen during provisioning.
+///
+/// [`WifiAuth::Auto`] preserves the historical behaviour (WPA2/WPA3 Personal),
+/// which negotiates cleanly on most hybrid networks. The explicit variants let
+/// the user pin a specific mode -- notably [`WifiAuth::WpaWpa2Personal`] for
+/// older APs that would otherwise time out under the WPA2/WPA3 default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WifiAuth {
+    /// Let the driver negotiate; maps to WPA2/WPA3 Personal (legacy default).
+    #[default]
+    Auto,
+    /// WPA/WPA2 Personal (mixed mode) -- for older access points.
+    WpaWpa2Personal,
+    /// WPA2 Personal only.
+    Wpa2Personal,
+    /// WPA2/WPA3 Personal (mixed mode).
+    Wpa2Wpa3Personal,
+    /// Open network (no password).
+    Open,
+}
+
+impl WifiAuth {
+    /// Human-readable label used on the provisioning screen.
+    pub fn label(self) -> &'static str {
+        match self {
+            WifiAuth::Auto => "Auto",
+            WifiAuth::WpaWpa2Personal => "WPA/WPA2 Personal",
+            WifiAuth::Wpa2Personal => "WPA2 Personal",
+            WifiAuth::Wpa2Wpa3Personal => "WPA2/WPA3 Personal",
+            WifiAuth::Open => "Open",
+        }
+    }
+
+    /// All variants in display order (used to build the selection screen).
+    pub const ALL: [WifiAuth; 5] = [
+        WifiAuth::Auto,
+        WifiAuth::WpaWpa2Personal,
+        WifiAuth::Wpa2Personal,
+        WifiAuth::Wpa2Wpa3Personal,
+        WifiAuth::Open,
+    ];
+
+    /// Stable string used for NVS persistence.
+    fn as_str(self) -> &'static str {
+        match self {
+            WifiAuth::Auto => "auto",
+            WifiAuth::WpaWpa2Personal => "wpa_wpa2",
+            WifiAuth::Wpa2Personal => "wpa2",
+            WifiAuth::Wpa2Wpa3Personal => "wpa2_wpa3",
+            WifiAuth::Open => "open",
+        }
+    }
+
+    fn from_str(s: &str) -> WifiAuth {
+        match s {
+            "wpa_wpa2" => WifiAuth::WpaWpa2Personal,
+            "wpa2" => WifiAuth::Wpa2Personal,
+            "wpa2_wpa3" => WifiAuth::Wpa2Wpa3Personal,
+            "open" => WifiAuth::Open,
+            _ => WifiAuth::Auto,
+        }
+    }
+
+    /// Map to the esp-idf-svc [`AuthMethod`]. `Auto` resolves to WPA2/WPA3
+    /// Personal to preserve the previous default behaviour.
+    pub fn to_auth_method(self) -> AuthMethod {
+        match self {
+            WifiAuth::Auto | WifiAuth::Wpa2Wpa3Personal => AuthMethod::WPA2WPA3Personal,
+            WifiAuth::WpaWpa2Personal => AuthMethod::WPAWPA2Personal,
+            WifiAuth::Wpa2Personal => AuthMethod::WPA2Personal,
+            WifiAuth::Open => AuthMethod::None,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Persisted configuration
 // ---------------------------------------------------------------------------
 
 /// User configuration persisted across reboots.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct StoredConfig {
     pub ssid: Option<String>,
     pub password: Option<String>,
+    /// Wi-Fi security type selected during provisioning.
+    pub auth_method: WifiAuth,
+    /// Whether serial/USB debug logging is enabled.
+    pub serial_debug: bool,
     /// Optional manual latitude/longitude override. When present it takes
     /// precedence over IP-based geolocation.
     pub manual_location: Option<(f64, f64)>,
+}
+
+impl Default for StoredConfig {
+    fn default() -> Self {
+        Self {
+            ssid: None,
+            password: None,
+            auth_method: WifiAuth::default(),
+            serial_debug: true,
+            manual_location: None,
+        }
+    }
 }
 
 impl StoredConfig {
@@ -89,6 +187,14 @@ impl ConfigStore {
     pub fn load(&self) -> Result<StoredConfig> {
         let ssid = self.get_string(KEY_SSID)?.filter(|s| !s.is_empty());
         let password = self.get_string(KEY_PASSWORD)?;
+        let auth_method = self
+            .get_string(KEY_AUTH)?
+            .map(|s| WifiAuth::from_str(&s))
+            .unwrap_or_default();
+        let serial_debug = self
+            .get_string(KEY_DEBUG)?
+            .map(|s| matches!(s.as_str(), "1" | "true"))
+            .unwrap_or(true);
         let lat = self
             .get_string(KEY_LAT)?
             .and_then(|s| s.parse::<f64>().ok());
@@ -102,6 +208,8 @@ impl ConfigStore {
         Ok(StoredConfig {
             ssid,
             password,
+            auth_method,
+            serial_debug,
             manual_location,
         })
     }
@@ -114,6 +222,12 @@ impl ConfigStore {
         self.nvs
             .set_str(KEY_PASSWORD, cfg.password.as_deref().unwrap_or(""))
             .context("failed to write password")?;
+        self.nvs
+            .set_str(KEY_AUTH, cfg.auth_method.as_str())
+            .context("failed to write auth method")?;
+        self.nvs
+            .set_str(KEY_DEBUG, if cfg.serial_debug { "1" } else { "0" })
+            .context("failed to write debug flag")?;
         match cfg.manual_location {
             Some((lat, lon)) => {
                 self.nvs.set_str(KEY_LAT, &lat.to_string())?;
@@ -129,7 +243,14 @@ impl ConfigStore {
 
     /// Erase all stored configuration (used by the "reset config" flow).
     pub fn clear(&mut self) -> Result<()> {
-        for key in [KEY_SSID, KEY_PASSWORD, KEY_LAT, KEY_LON] {
+        for key in [
+            KEY_SSID,
+            KEY_PASSWORD,
+            KEY_AUTH,
+            KEY_DEBUG,
+            KEY_LAT,
+            KEY_LON,
+        ] {
             let _ = self.nvs.remove(key);
         }
         Ok(())

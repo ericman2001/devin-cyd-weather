@@ -16,7 +16,7 @@ use embedded_graphics::primitives::{PrimitiveStyle, Rectangle, RoundedRectangle}
 use embedded_graphics::text::{Alignment, Baseline, Text, TextStyleBuilder};
 use esp_idf_hal::delay::FreeRtos;
 
-use crate::config::StoredConfig;
+use crate::config::{StoredConfig, WifiAuth};
 use crate::display::{CydDisplay, HEIGHT, WIDTH};
 use crate::touch::{Touch, TouchPoint};
 
@@ -68,20 +68,30 @@ impl<'a> Provisioner<'a> {
     pub fn run(&mut self, ssids: &[String]) -> Result<StoredConfig> {
         let ssid = self.select_ssid(ssids)?;
         let password = self.enter_text("Wi-Fi password", Keyboard::Full)?;
-        let manual_location = if self.confirm("Set manual lat/long?", "Yes", "No, use IP")? {
-            let lat = self.enter_text("Latitude (e.g. 30.27)", Keyboard::Numeric)?;
-            let lon = self.enter_text("Longitude (e.g. -97.74)", Keyboard::Numeric)?;
-            match (lat.trim().parse::<f64>(), lon.trim().parse::<f64>()) {
-                (Ok(la), Ok(lo)) => Some((la, lo)),
-                _ => None,
-            }
-        } else {
-            None
-        };
+        let auth_method = self.select_auth()?;
+        let serial_debug = self.confirm(
+            "Serial debug",
+            "Enable USB serial debug logging?",
+            "Enable",
+            "Disable",
+        )?;
+        let manual_location =
+            if self.confirm("Location", "Set manual lat/long?", "Yes", "No, use IP")? {
+                let lat = self.enter_text("Latitude (e.g. 30.27)", Keyboard::Numeric)?;
+                let lon = self.enter_text("Longitude (e.g. -97.74)", Keyboard::Numeric)?;
+                match (lat.trim().parse::<f64>(), lon.trim().parse::<f64>()) {
+                    (Ok(la), Ok(lo)) => Some((la, lo)),
+                    _ => None,
+                }
+            } else {
+                None
+            };
 
         Ok(StoredConfig {
             ssid: Some(ssid),
             password: Some(password),
+            auth_method,
+            serial_debug,
             manual_location,
         })
     }
@@ -206,9 +216,32 @@ impl<'a> Provisioner<'a> {
         }
     }
 
+    /// Wi-Fi security-type selection screen. Lets the user pick among the
+    /// [`WifiAuth`] variants; returns the chosen method.
+    fn select_auth(&mut self) -> Result<WifiAuth> {
+        const ROW_H: i32 = 34;
+        let top = 34;
+        loop {
+            self.header("Wi-Fi security")?;
+            let mut rows: Vec<(Hit, WifiAuth)> = Vec::new();
+            for (row, auth) in WifiAuth::ALL.iter().enumerate() {
+                let y = top + row as i32 * ROW_H;
+                let hit = Hit::new(10, y, W - 20, ROW_H - 6);
+                self.button(&hit, auth.label(), matches!(auth, WifiAuth::Auto));
+                rows.push((hit, *auth));
+            }
+            let tap = self.wait_tap()?;
+            for (hit, auth) in rows {
+                if hit.contains(tap) {
+                    return Ok(auth);
+                }
+            }
+        }
+    }
+
     /// Two-choice confirmation screen.
-    fn confirm(&mut self, question: &str, yes: &str, no: &str) -> Result<bool> {
-        self.header("Location")?;
+    fn confirm(&mut self, title: &str, question: &str, yes: &str, no: &str) -> Result<bool> {
+        self.header(title)?;
         self.text(question, W / 2, 60, &FONT_6X13, FG, Alignment::Center);
         let yes_hit = Hit::new(20, 120, W - 40, 40);
         let no_hit = Hit::new(20, 175, W - 40, 40);
