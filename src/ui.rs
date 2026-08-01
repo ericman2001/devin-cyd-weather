@@ -13,7 +13,7 @@ use embedded_graphics::primitives::{Circle, Line, PrimitiveStyle, Rectangle, Tri
 use embedded_graphics::text::{Alignment, Baseline, Text, TextStyleBuilder};
 
 use crate::display::{HEIGHT, WIDTH};
-use crate::weather::{aqi_category, WeatherData, WeatherIcon};
+use crate::weather::{aqi_category, uv_category, WeatherData, WeatherIcon};
 
 // -- Palette ----------------------------------------------------------------
 const BG: Rgb565 = Rgb565::new(2, 4, 8); // near-black navy
@@ -101,6 +101,16 @@ where
         MUTED,
         Alignment::Right,
     )?;
+    let feels = format!("Feels like {:.0}\u{00B0}F", data.feels_like_f);
+    draw_text(
+        display,
+        &feels,
+        WIDTH as i32 - 10,
+        68,
+        &FONT_6X10,
+        MUTED,
+        Alignment::Right,
+    )?;
 
     // Divider.
     Line::new(Point::new(8, 90), Point::new(WIDTH as i32 - 8, 90))
@@ -126,6 +136,24 @@ where
                 12,
                 140,
                 &FONT_6X13,
+                MUTED,
+                Alignment::Left,
+            )?;
+        }
+    }
+
+    match data.uv_index {
+        Some(uv) => {
+            let s = format!("UV: {:.0} ({})", uv, uv_category(uv));
+            draw_text(display, &s, 12, 154, &FONT_6X10, FG, Alignment::Left)?;
+        }
+        None => {
+            draw_text(
+                display,
+                "UV: n/a",
+                12,
+                154,
+                &FONT_6X10,
                 MUTED,
                 Alignment::Left,
             )?;

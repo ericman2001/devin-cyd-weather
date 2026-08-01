@@ -19,6 +19,7 @@ struct ForecastResponse {
 struct CurrentBlock {
     temperature_2m: f64,
     relative_humidity_2m: f64,
+    apparent_temperature: f64,
     weather_code: u16,
     wind_speed_10m: f64,
 }
@@ -39,6 +40,7 @@ struct AirQualityResponse {
 #[derive(Debug, Deserialize)]
 struct AqiBlock {
     us_aqi: Option<f64>,
+    uv_index: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -59,11 +61,14 @@ pub struct DailyForecast {
 #[derive(Debug, Clone)]
 pub struct WeatherData {
     pub temperature_f: f32,
+    pub feels_like_f: f32,
     pub humidity_pct: f32,
     pub wind_mph: f32,
     pub condition: WeatherCondition,
     /// US AQI (EPA scale). `None` when the air-quality API had no value.
     pub us_aqi: Option<u16>,
+    /// Current UV index. `None` when the air-quality API had no value.
+    pub uv_index: Option<f32>,
     pub daily: Vec<DailyForecast>,
 }
 
@@ -138,6 +143,17 @@ pub fn aqi_category(aqi: u16) -> &'static str {
     }
 }
 
+/// UV exposure category label for a given UV index (WHO scale).
+pub fn uv_category(uv: f32) -> &'static str {
+    match uv {
+        u if u < 3.0 => "Low",
+        u if u < 6.0 => "Moderate",
+        u if u < 8.0 => "High",
+        u if u < 11.0 => "Very High",
+        _ => "Extreme",
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Fetching
 // ---------------------------------------------------------------------------
@@ -145,7 +161,7 @@ pub fn aqi_category(aqi: u16) -> &'static str {
 fn build_forecast_url(lat: f64, lon: f64) -> String {
     format!(
         "{base}?latitude={lat:.4}&longitude={lon:.4}\
-         &current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m\
+         &current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m\
          &daily=weather_code,temperature_2m_max,temperature_2m_min\
          &temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch\
          &timezone=auto&forecast_days={days}",
@@ -156,7 +172,7 @@ fn build_forecast_url(lat: f64, lon: f64) -> String {
 
 fn build_air_quality_url(lat: f64, lon: f64) -> String {
     format!(
-        "{base}?latitude={lat:.4}&longitude={lon:.4}&current=us_aqi",
+        "{base}?latitude={lat:.4}&longitude={lon:.4}&current=us_aqi,uv_index",
         base = AIR_QUALITY_API_BASE,
     )
 }
@@ -171,9 +187,9 @@ pub fn fetch(lat: f64, lon: f64) -> Result<WeatherData> {
     let forecast: ForecastResponse =
         serde_json::from_str(&forecast_body).context("failed to parse forecast response")?;
 
-    let us_aqi = fetch_aqi(lat, lon).unwrap_or_else(|e| {
+    let (us_aqi, uv_index) = fetch_aqi(lat, lon).unwrap_or_else(|e| {
         log::warn!("air-quality fetch failed: {e:#}");
-        None
+        (None, None)
     });
 
     let mut daily = Vec::new();
@@ -195,17 +211,22 @@ pub fn fetch(lat: f64, lon: f64) -> Result<WeatherData> {
 
     Ok(WeatherData {
         temperature_f: forecast.current.temperature_2m as f32,
+        feels_like_f: forecast.current.apparent_temperature as f32,
         humidity_pct: forecast.current.relative_humidity_2m as f32,
         wind_mph: forecast.current.wind_speed_10m as f32,
         condition: describe_weather_code(forecast.current.weather_code),
         us_aqi,
+        uv_index,
         daily,
     })
 }
 
-fn fetch_aqi(lat: f64, lon: f64) -> Result<Option<u16>> {
+fn fetch_aqi(lat: f64, lon: f64) -> Result<(Option<u16>, Option<f32>)> {
     let body = crate::http::get(&build_air_quality_url(lat, lon), 8 * 1024)?;
     let resp: AirQualityResponse =
         serde_json::from_str(&body).context("failed to parse air-quality response")?;
-    Ok(resp.current.us_aqi.map(|v| v.round() as u16))
+    Ok((
+        resp.current.us_aqi.map(|v| v.round() as u16),
+        resp.current.uv_index.map(|v| v as f32),
+    ))
 }
