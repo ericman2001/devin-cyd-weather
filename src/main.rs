@@ -14,6 +14,7 @@ mod config;
 mod display;
 mod http;
 mod location;
+mod png_stream;
 mod provisioning;
 mod radar;
 mod storage;
@@ -329,14 +330,7 @@ fn run_refresh_loop(
             }
         };
 
-        wait_with_backlight(
-            dev,
-            cfg,
-            &mut state,
-            last_good.as_ref(),
-            &location,
-            sleep_secs,
-        );
+        wait_with_backlight(dev, &mut state, last_good.as_ref(), &location, sleep_secs);
     }
 }
 
@@ -367,12 +361,7 @@ fn draw_weather_screen(
 
 /// Enter the radar screen: (re-)stage the frames if they are missing or stale,
 /// then show the first one.
-fn enter_radar_screen(
-    dev: &mut Devices,
-    cfg: &mut StoredConfig,
-    state: &mut AppState,
-    location: &Location,
-) {
+fn enter_radar_screen(dev: &mut Devices, state: &mut AppState, location: &Location) {
     ui::draw_radar_chrome(dev.disp, "Radar", "Loading...").ok();
     ui::draw_toolbar(dev.disp, Screen::Radar).ok();
 
@@ -382,7 +371,7 @@ fn enter_radar_screen(
     }
 
     if state.radar.is_stale() {
-        match refresh_radar(dev, cfg, state, location) {
+        match refresh_radar(dev, state, location) {
             Ok(frames) => {
                 state.radar.frames = frames;
                 state.radar.staged_at = Some(Instant::now());
@@ -404,38 +393,11 @@ fn enter_radar_screen(
     show_radar_frame(dev.disp, state);
 }
 
-/// Download the radar tiles, then decode them **with the radio stopped**.
-///
-/// Inflating a PNG needs a 32 KB contiguous heap block; the Wi-Fi driver and
-/// the TLS session hold enough of the heap that the allocation fails (and a
-/// failed allocation aborts the firmware rather than returning an error), so
-/// the two phases never overlap.
-fn refresh_radar(
-    dev: &mut Devices,
-    cfg: &mut StoredConfig,
-    state: &mut AppState,
-    location: &Location,
-) -> Result<usize> {
+/// Download the radar tiles, then decode them into displayable frames.
+fn refresh_radar(dev: &mut Devices, state: &mut AppState, location: &Location) -> Result<usize> {
     let tiles = radar::download_tiles(&state.radar.source, location.latitude, location.longitude)?;
-
     ui::draw_radar_status(dev.disp, "Decoding...").ok();
-    let stopped = match dev.wifi.stop() {
-        Ok(()) => true,
-        Err(e) => {
-            log::warn!("could not stop wifi before decoding: {e:#}");
-            false
-        }
-    };
-
-    let decoded = radar::decode_tiles(tiles, location.latitude, location.longitude);
-
-    if stopped {
-        match dev.wifi.start() {
-            Ok(()) => ensure_connected(dev.disp, dev.wifi, cfg),
-            Err(e) => log::warn!("could not restart wifi after decoding: {e:#}"),
-        }
-    }
-    decoded
+    radar::decode_tiles(tiles, location.latitude, location.longitude)
 }
 
 /// Stream the current radar frame from the SD card onto the panel.
@@ -465,7 +427,6 @@ fn show_radar_frame(disp: &mut CydDisplay, state: &mut AppState) {
 /// always-on device).
 fn wait_with_backlight(
     dev: &mut Devices,
-    cfg: &mut StoredConfig,
     state: &mut AppState,
     last_good: Option<&WeatherData>,
     location: &Location,
@@ -497,7 +458,7 @@ fn wait_with_backlight(
                         Screen::Weather => {
                             draw_weather_screen(dev.disp, last_good, location, false)
                         }
-                        Screen::Radar => enter_radar_screen(dev, cfg, state, location),
+                        Screen::Radar => enter_radar_screen(dev, state, location),
                     }
                 }
             }

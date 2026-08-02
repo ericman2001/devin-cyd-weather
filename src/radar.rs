@@ -16,13 +16,13 @@
 //! The tile source is pluggable via [`RadarSource`] because Open-Meteo does not
 //! serve radar imagery; [`RainViewer`] is the bundled implementation.
 //!
-//! Download and decode are deliberately *separate* phases: inflating a PNG
-//! needs a 32 KB contiguous zlib window, which does not exist while the Wi-Fi
-//! and TLS stacks are up, so the caller stops the radio between the two (see
-//! `main::refresh_radar`).
+//! Decoding goes through [`crate::png_stream`], which inflates through a
+//! statically reserved 32 KiB window instead of allocating one, so the whole
+//! pipeline runs without competing with Wi-Fi/TLS for the heap.
 
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -31,19 +31,15 @@ use embedded_graphics::pixelcolor::Rgb565;
 use serde::Deserialize;
 
 use crate::config::{
-    RADAR_COLOR_SCHEME, RADAR_DECODE_MIN_BLOCK, RADAR_FRAME_COUNT, RADAR_TILE_MAX_BYTES,
-    RADAR_VIEW_HEIGHT, RADAR_VIEW_WIDTH, RADAR_ZOOM, RAINVIEWER_INDEX_API,
-    RAINVIEWER_INDEX_MAX_BYTES,
+    RADAR_COLOR_SCHEME, RADAR_FRAME_COUNT, RADAR_TILE_MAX_BYTES, RADAR_VIEW_HEIGHT,
+    RADAR_VIEW_WIDTH, RADAR_ZOOM, RAINVIEWER_INDEX_API, RAINVIEWER_INDEX_MAX_BYTES,
 };
 use crate::display::CydDisplay;
+use crate::png_stream::{self, Row, RowSink};
 use crate::storage;
 
 /// Directory (under the SD mount point) holding the staged radar frames.
 const FRAME_DIR: &str = "radar";
-
-/// Cap on the PNG decoder's own allocations, so an oversized image fails with
-/// an error instead of taking the heap (and the board) down.
-const DECODE_LIMIT_BYTES: u32 = 96 * 1024;
 
 /// Magic + dimensions prefixed to every `.rgb565` frame file.
 const MAGIC: [u8; 4] = *b"R565";
@@ -236,60 +232,10 @@ impl Geometry {
 
 /// Decode `src` (a PNG on the SD card) into a raw Rgb565 frame at `dst`.
 ///
-/// The image is processed one scanline at a time; peak RAM is one source row
-/// plus one output row plus the PNG decoder's internal window.
+/// The image is processed one scanline at a time and the inflate window lives
+/// in static memory, so peak heap is two source rows plus one output row.
 pub fn decode_to_frame(src: &Path, dst: &Path, geom: &Geometry) -> Result<()> {
-    // Inflating needs a 32 KB contiguous window plus working buffers. Refuse
-    // up front when the heap cannot serve that: a failed allocation inside the
-    // decoder aborts the whole firmware rather than returning an error.
-    let (free, largest) = heap_stats();
-    if largest < RADAR_DECODE_MIN_BLOCK {
-        bail!(
-            "not enough heap to decode a radar frame: largest free block {largest} B \
-             (need {RADAR_DECODE_MIN_BLOCK} B, {free} B free in total)"
-        );
-    }
-
     let file = File::open(src).with_context(|| format!("failed to open {}", src.display()))?;
-    let mut decoder = png::Decoder::new(BufReader::with_capacity(1024, file));
-    // Expand palette / low-bit-depth images so every row arrives as 8-bit
-    // channels; that keeps the per-pixel conversion below trivial.
-    decoder.set_transformations(png::Transformations::EXPAND);
-    decoder.set_ignore_text_chunk(true);
-    decoder.set_limits(png::Limits {
-        bytes: DECODE_LIMIT_BYTES as usize,
-    });
-
-    let mut reader = decoder
-        .read_info()
-        .with_context(|| format!("{} is not a readable PNG", src.display()))?;
-
-    let info = reader.info();
-    if info.interlaced {
-        bail!("interlaced PNGs are not supported by the streaming decoder");
-    }
-    let (src_w, src_h) = (info.width, info.height);
-    let (color, depth) = reader.output_color_type();
-    if depth != png::BitDepth::Eight {
-        bail!("unsupported PNG bit depth {depth:?} (expected 8 bits per channel)");
-    }
-    let channels = match color {
-        png::ColorType::Grayscale => 1,
-        png::ColorType::GrayscaleAlpha => 2,
-        png::ColorType::Rgb => 3,
-        png::ColorType::Rgba => 4,
-        png::ColorType::Indexed => bail!("indexed PNG was not expanded by the decoder"),
-    };
-
-    if geom.crop_x + geom.crop_w > src_w || geom.crop_y + geom.crop_h > src_h {
-        bail!(
-            "crop {}x{}+{}+{} does not fit the {src_w}x{src_h} source image",
-            geom.crop_w,
-            geom.crop_h,
-            geom.crop_x,
-            geom.crop_y
-        );
-    }
 
     let mut out = BufWriter::with_capacity(
         1024,
@@ -297,32 +243,20 @@ pub fn decode_to_frame(src: &Path, dst: &Path, geom: &Geometry) -> Result<()> {
     );
     write_header(&mut out, geom.out_w as u16, geom.out_h as u16)?;
 
-    let mut row_out = vec![0u8; geom.out_w as usize * 2];
-    let mut src_y = 0u32;
-    let mut out_y = 0u32;
-
-    while let Some(row) = reader
-        .next_row()
-        .with_context(|| format!("failed to decode a scanline of {}", src.display()))?
-    {
-        // Nearest-neighbour vertical resampling: emit every output row whose
-        // source row is the one we are currently holding.
-        while out_y < geom.out_h && geom.crop_y + out_y * geom.crop_h / geom.out_h == src_y {
-            convert_row(row.data(), channels, geom, &mut row_out);
-            out.write_all(&row_out)
-                .with_context(|| format!("failed to write {}", dst.display()))?;
-            out_y += 1;
-        }
-        src_y += 1;
-        if out_y >= geom.out_h {
-            break;
-        }
-    }
+    let mut sink = FrameSink {
+        out: &mut out,
+        geom,
+        row_out: vec![0u8; geom.out_w as usize * 2],
+        out_y: 0,
+    };
+    png_stream::decode(BufReader::with_capacity(512, file), &mut sink)
+        .with_context(|| format!("failed to decode {}", src.display()))?;
 
     // Pad if the source ran short so the frame always has its declared size.
-    row_out.fill(0);
+    let mut out_y = sink.out_y;
+    let blank = vec![0u8; geom.out_w as usize * 2];
     while out_y < geom.out_h {
-        out.write_all(&row_out)
+        out.write_all(&blank)
             .with_context(|| format!("failed to write {}", dst.display()))?;
         out_y += 1;
     }
@@ -330,6 +264,44 @@ pub fn decode_to_frame(src: &Path, dst: &Path, geom: &Geometry) -> Result<()> {
     out.flush()
         .with_context(|| format!("failed to flush {}", dst.display()))?;
     Ok(())
+}
+
+/// Turns decoded scanlines into the cropped, resampled Rgb565 frame body.
+struct FrameSink<'a, W: Write> {
+    out: &'a mut W,
+    geom: &'a Geometry,
+    row_out: Vec<u8>,
+    out_y: u32,
+}
+
+impl<W: Write> RowSink for FrameSink<'_, W> {
+    fn start(&mut self, width: u32, height: u32) -> Result<()> {
+        let g = self.geom;
+        if g.crop_x + g.crop_w > width || g.crop_y + g.crop_h > height {
+            bail!(
+                "crop {}x{}+{}+{} does not fit the {width}x{height} source image",
+                g.crop_w,
+                g.crop_h,
+                g.crop_x,
+                g.crop_y
+            );
+        }
+        Ok(())
+    }
+
+    fn row(&mut self, y: u32, row: &Row) -> Result<bool> {
+        // Nearest-neighbour vertical resampling: emit every output row that
+        // maps onto the source row we are currently holding.
+        let g = self.geom;
+        while self.out_y < g.out_h && g.crop_y + self.out_y * g.crop_h / g.out_h == y {
+            convert_row(row, g, &mut self.row_out);
+            self.out
+                .write_all(&self.row_out)
+                .context("failed to write a frame row")?;
+            self.out_y += 1;
+        }
+        Ok(self.out_y < g.out_h)
+    }
 }
 
 fn write_header<W: Write>(out: &mut W, width: u16, height: u16) -> Result<()> {
@@ -342,16 +314,10 @@ fn write_header<W: Write>(out: &mut W, width: u16, height: u16) -> Result<()> {
 }
 
 /// Convert one decoded source scanline into a horizontally resampled Rgb565 row.
-fn convert_row(src: &[u8], channels: usize, geom: &Geometry, dst: &mut [u8]) {
+fn convert_row(src: &Row, geom: &Geometry, dst: &mut [u8]) {
     for out_x in 0..geom.out_w as usize {
         let src_x = geom.crop_x as usize + out_x * geom.crop_w as usize / geom.out_w as usize;
-        let px = &src[src_x * channels..src_x * channels + channels];
-        let (r, g, b, a) = match channels {
-            1 => (px[0], px[0], px[0], 255),
-            2 => (px[0], px[0], px[0], px[1]),
-            3 => (px[0], px[1], px[2], 255),
-            _ => (px[0], px[1], px[2], px[3]),
-        };
+        let (r, g, b, a) = src.pixel(src_x);
         let raw = rgb565(
             blend(r, a, RADAR_BG.0),
             blend(g, a, RADAR_BG.1),
@@ -410,11 +376,8 @@ fn download_tile(url: &str, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Phase 2 (no network): decode the `count` staged tiles into compact
-/// `frame_{i}.rgb565` files and delete the encoded originals.
-///
-/// Call this with the Wi-Fi driver stopped: the decoder needs a 32 KB
-/// contiguous block that the radio's buffers otherwise occupy.
+/// Phase 2: decode the `count` staged tiles into compact `frame_{i}.rgb565`
+/// files and delete the encoded originals.
 pub fn decode_tiles(count: usize, lat: f64, lon: f64) -> Result<usize> {
     log_heap("before decode");
     let geom = Geometry::centered_on(lat, lon, RADAR_ZOOM);

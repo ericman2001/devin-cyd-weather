@@ -63,13 +63,6 @@ pub const RADAR_FRAME_COUNT: usize = 6;
 pub const RADAR_VIEW_WIDTH: u16 = 240;
 pub const RADAR_VIEW_HEIGHT: u16 = 240;
 
-/// Smallest contiguous heap block the PNG decoder is allowed to start with.
-///
-/// Inflating needs a 32 KB zlib window plus working buffers, and a failed
-/// allocation inside the decoder aborts the firmware instead of returning an
-/// error, so the decode is skipped unless this much is free in one block.
-pub const RADAR_DECODE_MIN_BLOCK: usize = 48 * 1024;
-
 /// Dwell time per radar frame during the slideshow.
 pub const RADAR_FRAME_MS: u64 = 600;
 

@@ -188,16 +188,18 @@ can spare while Wi-Fi and TLS are up — so no stage ever holds a whole image:
 Frame files are raw Rgb565 prefixed with an 8-byte header (`R565`, then width
 and height as little-endian `u16`s).
 
-Download and decode are separate phases on purpose. Inflating a PNG needs a
-32 KB *contiguous* heap block for the zlib window, and no such block exists
-while the Wi-Fi driver and the TLS session hold the large allocations — the
-failed allocation aborts the firmware rather than returning an error. So all
-tiles are downloaded first, the radio is stopped (`Wifi::stop`), the tiles are
-decoded, and the station reconnects. As a backstop the decoder refuses to start
-unless the largest free block is at least `RADAR_DECODE_MIN_BLOCK`, and heap
-stats are logged around both phases (`heap[before download]`, `heap[before
-decode]`, `heap[after decode]`). `sdkconfig.defaults` additionally enables
-mbedTLS dynamic buffers and trims the Wi-Fi buffer pools.
+The decoder is `src/png_stream.rs` rather than the `png` crate. Inflating needs
+a 32 KiB sliding window, and `png` allocates several buffers that size on the
+heap; with Wi-Fi up those allocations fail, and a failed allocation *aborts* the
+firmware instead of returning an error. `png_stream` drives `miniz_oxide`'s
+inflate core over a window and inflate state reserved statically in `.bss`, so
+decoding costs no heap beyond two scanline buffers and cannot OOM. It handles
+non-interlaced 8-bit greyscale/RGB/RGBA and 1/2/4/8-bit palette (with `tRNS`)
+images — the shapes radar tiles come in.
+
+Heap headroom is logged around both phases (`heap[before download]`,
+`heap[before decode]`, `heap[after decode]`), and `sdkconfig.defaults` enables
+mbedTLS dynamic buffers and trims the Wi-Fi buffer pools to keep the margin.
 
 ### Changing the radar source
 
@@ -224,6 +226,7 @@ flags there.
 | `src/touch.rs` | XPT2046 bit-banged SPI reader + calibration |
 | `src/storage.rs` | SD card (SDSPI) + FAT filesystem mounted at `/sdcard` |
 | `src/radar.rs` | Radar tile sources, row-wise decoder, frame streaming |
+| `src/png_stream.rs` | Heap-free scanline PNG reader (static 32 KiB inflate window) |
 | `src/wifi.rs` | Station scan/connect |
 | `src/provisioning.rs` | Touch setup UI (list, keyboard, keypad) |
 | `src/location.rs` | IP geolocation |
