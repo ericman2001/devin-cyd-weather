@@ -51,5 +51,11 @@ anyhow = "1.0.104"
 # Fixed-capacity collections used on the heap-constrained device
 heapless = "0.8.0"
 
+# Raw DEFLATE core for `src/png_stream.rs`. The `png` crate is unusable on this
+# target: it grows several 32 KiB zlib buffers on the heap, which fails (and
+# aborts) once Wi-Fi is up. Driving the inflate core directly lets us hand it a
+# statically reserved window instead.
+miniz_oxide = "0.8.9"
+
 [build-dependencies]
 embuild = "0.33.2"

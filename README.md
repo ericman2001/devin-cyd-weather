@@ -30,6 +30,8 @@ Hardware reference:
   and graceful error/status screens.
 - Refreshes every **30 minutes**, keeping the last good reading on transient
   network failures and showing a retry banner.
+- **Animated radar slideshow** on a second screen, reachable from the bottom
+  toolbar, built on a fully streaming SD-card pipeline (see below).
 
 ## Hardware pin mapping (ESP32-2432S028R)
 
@@ -42,11 +44,23 @@ Hardware reference:
 | TFT DC          | 2    | SPI2           |
 | TFT backlight   | 21   | GPIO out       |
 | TFT reset       | —    | tied to EN     |
-| Touch T_CLK     | 25   | SPI3 (touch)   |
-| Touch T_MOSI    | 32   | SPI3           |
-| Touch T_MISO    | 39   | SPI3 (in only) |
-| Touch T_CS      | 33   | SPI3           |
+| Touch T_CLK     | 25   | software SPI   |
+| Touch T_MOSI    | 32   | software SPI   |
+| Touch T_MISO    | 39   | software SPI (in only) |
+| Touch T_CS      | 33   | software SPI   |
 | Touch T_IRQ     | 36   | GPIO in only   |
+| SD SCK          | 18   | SPI3 (SD card) |
+| SD MOSI         | 23   | SPI3           |
+| SD MISO         | 19   | SPI3           |
+| SD CS           | 5    | SPI3           |
+
+> **Three SPI devices, two SPI hosts.** The ESP32 exposes only SPI2 and SPI3
+> for general use, and the CYD has three SPI peripherals. The display keeps
+> SPI2 and the SD card takes SPI3, so the XPT2046 touch controller is driven by
+> a **bit-banged mode-0 SPI** in `src/touch.rs` (it tops out at 2 MHz anyway,
+> so nothing is lost). The SD pins above are the standard CYD micro-SD slot on
+> the back of the board — verify them against your board revision before
+> concluding the radar screen is broken.
 
 > **CYD variant note:** the two-USB "CYD2USB" revision ships an **ST7789**
 > controller with the backlight on **GPIO 27** (not 21). If your board shows a
@@ -140,6 +154,132 @@ credentials/location are erased and the setup UI is shown again. If a saved
 network later fails to connect, the device also drops back into setup and waits
 for a tap.
 
+## Radar slideshow (SD card required)
+
+The second screen animates recent + nowcast precipitation radar for your
+location. It needs a **FAT32-formatted micro-SD card** in the slot on the back
+of the board; without one the firmware logs a warning, keeps working, and the
+radar screen reports that no card is present. The firmware never formats the
+card, so existing data is safe.
+
+Tap the bottom toolbar to switch between **Weather**, **Radar** and the gear
+(**Settings**). (When the backlight is off, the first tap only wakes the
+screen.) On the radar screen the staged frames cycle every 600 ms and are
+re-downloaded when older than 10 minutes; the animation pauses whenever the
+backlight is off. The 30-minute weather refresh and the tap-activated backlight
+behave exactly as before.
+
+### Settings screen
+
+The gear tab lists four rows; tapping one acts on it immediately and persists
+the result to NVS:
+
+| Row | Effect |
+|-----|--------|
+| Location | Opens the auto/manual chooser and numeric keypad, then re-resolves the position |
+| Wi-Fi | Re-runs the provisioning flow (scan, password, security) and reconnects |
+| Radar forecast | Cycles the forecast horizon: off, 15, 30, 60 or 90 minutes |
+| Radar past frames | Switches the past half between measured RainViewer radar and HRRR model output |
+
+Changing any radar setting drops the staged frames so the next visit to the
+radar screen re-stages them.
+
+### Memory-conscious streaming pipeline
+
+A single decoded 256x256 RGBA radar tile is 256 KB — far more than the ESP32
+can spare while Wi-Fi and TLS are up — so no stage ever holds a whole image:
+
+1. **Download -> SD.** `radar::download_tiles` / `http::get_to_writer` stream
+   the HTTP body straight into a file on the card through a 512-byte buffer.
+2. **Row-wise decode -> SD.** `radar::decode_tiles` seeds each
+   `/sdcard/radar/frame_{i}.rgb565` from the cached basemap frame, then decodes
+   every tile of that frame one scanline at a time, blending each row straight
+   into its sub-rectangle of the file (read-modify-write at a byte offset).
+   Only a couple of rows are in RAM.
+3. **Stream -> display.** `radar::blit_frame` reads a staged frame back in
+   4-row bands and pushes each band into a `mipidsi` address window, so the
+   panel is fed from the SD card with no framebuffer. This path bypasses the
+   `embedded-graphics` vector rendering used by `src/ui.rs`.
+
+Frame files are raw Rgb565 prefixed with an 8-byte header (`R565`, then width
+and height as little-endian `u16`s).
+
+The decoder is `src/png_stream.rs` rather than the `png` crate. Inflating needs
+a 32 KiB sliding window, and `png` allocates several buffers that size on the
+heap; with Wi-Fi up those allocations fail, and a failed allocation *aborts* the
+firmware instead of returning an error. `png_stream` drives `miniz_oxide`'s
+inflate core over a window and inflate state reserved statically in `.bss`, so
+decoding costs no heap beyond two scanline buffers and cannot OOM. It handles
+non-interlaced 8-bit greyscale/RGB/RGBA and 1/2/4/8-bit palette (with `tRNS`)
+images — the shapes radar tiles come in.
+
+### Basemap and location marker
+
+Radar alone is hard to read, so each frame is composited over a basemap
+(`config::BASEMAP_TILE_URL`, CARTO's dark style rendered from OpenStreetMap
+data) — coastlines, roads and place labels. The basemap is composed once into
+`/sdcard/radar/base_{z}_{x0}_{y0}.rgb565` and reused as the seed for every
+radar frame, so it costs one file copy rather than a framebuffer; basemaps
+composed for a previous view are deleted. If the download fails the radar still
+renders, just over a flat background. A crosshair marks the configured
+location, and the status line carries the `RainViewer/HRRR-IEM/OSM`
+attribution.
+
+Each frame's time (recorded alongside the frames in
+`/sdcard/radar/times.txt`) is shown in the radar title, e.g. `Radar  7:15 PM`,
+with forecast frames marked `fcst`. The times are rendered in local time using
+the `utc_offset_seconds` the forecast API reports for your coordinates.
+
+### View geometry
+
+`radar::View` is a 240x240 window in slippy-map *pixel* space centred on the
+configured position, so the viewer is in the middle of the screen rather than
+wherever they happen to fall inside one tile. That window normally straddles a
+2x2 block of tiles: `View::tiles` intersects it with each tile and yields a
+crop plus a destination offset, and every frame is assembled from those (up to
+four downloads and four decodes per frame, plus a one-off set for the basemap).
+`RadarSource` therefore returns URL *templates* containing `{z}`/`{x}`/`{y}`
+rather than finished URLs.
+
+Heap headroom is logged around both phases (`heap[before download]`,
+`heap[before decode]`, `heap[after decode]`), and `sdkconfig.defaults` enables
+mbedTLS dynamic buffers so TLS I/O buffers are freed between handshakes.
+
+### Radar sources: observed past + forecast future
+
+The slideshow runs from the recent past into the near future, and each half
+comes from a different service:
+
+* **Observed** frames are RainViewer composite radar (2 hours of past data at
+  10-minute steps). Its free API no longer serves nowcast frames, so it cannot
+  provide the future.
+* **Forecast** frames are NCEP HRRR "1000 m simulated reflectivity" rendered as
+  slippy-map tiles by the [Iowa Environmental
+  Mesonet](https://mesonet.agron.iastate.edu/GIS/model.phtml). Tiles are
+  addressed by *forecast minute* relative to a model run, so the firmware reads
+  the run's metadata JSON and works out which minutes correspond to the next
+  `radar_forecast_minutes` (default 30, in 15-minute steps; adjustable on the
+  settings screen). This is a model
+  prediction, not a measurement, and it covers **CONUS only** — elsewhere the
+  forecast frames come back empty.
+
+One HRRR run publishes frames on both sides of "now", so the settings screen
+can also drive the past half from the model (`Radar past frames: HRRR model`)
+for a single source and one colour ramp across the animation — at the cost of
+showing modelled rather than measured precipitation.
+
+Forecast frames need to know the current time, which the board has no
+RTC for: `src/clock.rs` starts SNTP after Wi-Fi comes up, and the forecast half
+is skipped (with the observed half still shown) if the clock never syncs.
+
+Open-Meteo serves no radar imagery, so sources are pluggable: implement
+`radar::RadarSource` (one method returning tile URL templates with `{z}`/`{x}`/
+`{y}`, oldest first) and pass it to `radar::download_tiles`. The bundled
+implementations are `radar::RainViewer`, `radar::Hrrr` and `radar::Pipeline`,
+which chains the two according to the saved settings. Zoom level, colour scheme,
+frame counts, forecast horizon, dwell time and the refresh interval are
+constants in `src/config.rs`.
+
 ## Touch calibration
 
 Raw XPT2046 ADC values are mapped to screen coordinates by `Calibration` in
@@ -154,13 +294,17 @@ flags there.
 | `src/main.rs` | Boot flow + 30-minute refresh loop |
 | `src/config.rs` | NVS-backed config + tunable constants |
 | `src/display.rs` | ILI9341 (`mipidsi`) SPI init + backlight |
-| `src/touch.rs` | XPT2046 SPI reader + calibration |
+| `src/touch.rs` | XPT2046 bit-banged SPI reader + calibration |
+| `src/storage.rs` | SD card (SDSPI) + FAT filesystem mounted at `/sdcard` |
+| `src/radar.rs` | Radar tile sources, row-wise decoder, frame streaming |
+| `src/png_stream.rs` | Heap-free scanline PNG reader (static 32 KiB inflate window) |
+| `src/clock.rs` | SNTP time sync, needed to address forecast radar frames |
 | `src/wifi.rs` | Station scan/connect |
 | `src/provisioning.rs` | Touch setup UI (list, keyboard, keypad) |
 | `src/location.rs` | IP geolocation |
 | `src/weather.rs` | Open-Meteo forecast + AQI, WMO code mapping |
-| `src/ui.rs` | Weather dashboard + status/error rendering |
-| `src/http.rs` | HTTPS GET helper (mbedTLS cert bundle) |
+| `src/ui.rs` | Weather dashboard, radar chrome, settings list, toolbar, status/error rendering |
+| `src/http.rs` | HTTPS GET helpers (buffered + streaming, mbedTLS cert bundle) |
 
 ## License
 

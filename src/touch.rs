@@ -1,7 +1,5 @@
 //! XPT2046 resistive touch controller driver for the CYD.
 //!
-//! The touch controller lives on its own SPI bus (separate from the display):
-//!
 //! | Signal | GPIO |
 //! |--------|------|
 //! | T_CLK  | 25   |
@@ -10,18 +8,23 @@
 //! | T_CS   | 33   |
 //! | T_IRQ  | 36 (input only) |
 //!
-//! This is a small hand-written SPI reader rather than an external crate so the
-//! calibration mapping is easy to tune against a specific panel.
+//! The controller is driven with a **bit-banged** SPI mode-0 transfer rather
+//! than a hardware SPI host. The ESP32 only exposes two general-purpose SPI
+//! hosts, and the CYD needs three SPI peripherals: the display owns SPI2 and
+//! the SD card (added for the radar slideshow, see `src/storage.rs`) owns SPI3.
+//! The XPT2046 tops out at 2 MHz anyway, so software SPI costs nothing here
+//! and it keeps the calibration mapping easy to tune against a specific panel.
 
 use anyhow::{Context, Result};
-use esp_idf_hal::gpio::{AnyIOPin, AnyInputPin, AnyOutputPin, Input, PinDriver, Pull};
-use esp_idf_hal::spi::config::{Config as SpiConfig, DriverConfig};
-use esp_idf_hal::spi::{SpiAnyPins, SpiDeviceDriver, SpiDriver};
-use esp_idf_hal::units::FromValueType;
+use esp_idf_hal::delay::Ets;
+use esp_idf_hal::gpio::{AnyInputPin, AnyOutputPin, Input, Output, PinDriver, Pull};
 
 // XPT2046 control bytes: start bit + channel select, 12-bit, differential mode.
 const CMD_READ_X: u8 = 0x90;
 const CMD_READ_Y: u8 = 0xD0;
+
+/// Half clock period of the bit-banged bus (~250 kHz, well under the 2 MHz max).
+const CLK_HALF_US: u32 = 2;
 
 /// Raw-ADC-to-screen calibration. The defaults are typical for the CYD panel;
 /// tune them with the reported raw values if touches land in the wrong place.
@@ -82,8 +85,6 @@ fn map_range(raw: u16, min: u16, max: u16, span: u16) -> i32 {
     ((raw - min) * (span - 1)) / (max - min).max(1)
 }
 
-type TouchSpi = SpiDeviceDriver<'static, SpiDriver<'static>>;
-
 /// A calibrated touch point in the 240x320 screen coordinate space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TouchPoint {
@@ -92,40 +93,80 @@ pub struct TouchPoint {
 }
 
 pub struct Touch {
-    spi: TouchSpi,
+    clk: PinDriver<'static, Output>,
+    mosi: PinDriver<'static, Output>,
+    miso: PinDriver<'static, Input>,
+    cs: PinDriver<'static, Output>,
     irq: PinDriver<'static, Input>,
     cal: Calibration,
 }
 
 impl Touch {
-    /// Initialise the touch controller on its dedicated SPI bus.
-    pub fn init<SPI: SpiAnyPins + 'static>(
-        spi: SPI,
-        sclk: AnyIOPin<'static>,
-        mosi: AnyIOPin<'static>,
+    /// Initialise the touch controller on its bit-banged SPI pins.
+    pub fn init(
+        sclk: AnyOutputPin<'static>,
+        mosi: AnyOutputPin<'static>,
         miso: AnyInputPin<'static>,
         cs: AnyOutputPin<'static>,
         irq: AnyInputPin<'static>,
         cal: Calibration,
     ) -> Result<Self> {
-        let driver = SpiDriver::new(spi, sclk, mosi, Some(miso), &DriverConfig::default())
-            .context("failed to create touch SPI driver")?;
-        // The XPT2046 requires a low SPI clock (<= 2.5 MHz).
-        let cfg = SpiConfig::new().baudrate(2.MHz().into());
-        let spi = SpiDeviceDriver::new(driver, Some(cs), &cfg)
-            .context("failed to create touch SPI device")?;
+        let mut clk = PinDriver::output(sclk).context("failed to configure touch CLK pin")?;
+        let mut mosi = PinDriver::output(mosi).context("failed to configure touch MOSI pin")?;
+        let miso =
+            PinDriver::input(miso, Pull::Floating).context("failed to configure touch MISO pin")?;
+        let mut cs = PinDriver::output(cs).context("failed to configure touch CS pin")?;
         let irq = PinDriver::input(irq, Pull::Up).context("failed to configure touch IRQ pin")?;
-        Ok(Self { spi, irq, cal })
+
+        clk.set_low().context("failed to idle touch CLK")?;
+        mosi.set_low().context("failed to idle touch MOSI")?;
+        cs.set_high().context("failed to deselect touch")?;
+
+        Ok(Self {
+            clk,
+            mosi,
+            miso,
+            cs,
+            irq,
+            cal,
+        })
+    }
+
+    /// Clock one byte out on MOSI while clocking one byte in on MISO (mode 0,
+    /// MSB first): data is presented while CLK is low and sampled on its
+    /// rising edge.
+    fn transfer_byte(&mut self, out: u8) -> Result<u8> {
+        let mut input = 0u8;
+        for bit in (0..8).rev() {
+            if (out >> bit) & 1 == 1 {
+                self.mosi.set_high()
+            } else {
+                self.mosi.set_low()
+            }
+            .context("touch MOSI write failed")?;
+            Ets::delay_us(CLK_HALF_US);
+
+            self.clk.set_high().context("touch CLK write failed")?;
+            input = (input << 1) | u8::from(self.miso.is_high());
+            Ets::delay_us(CLK_HALF_US);
+
+            self.clk.set_low().context("touch CLK write failed")?;
+        }
+        Ok(input)
     }
 
     fn read_channel(&mut self, cmd: u8) -> Result<u16> {
-        let mut buf = [cmd, 0x00, 0x00];
-        self.spi
-            .transfer_in_place(&mut buf)
-            .map_err(|e| anyhow::anyhow!("touch SPI transfer failed: {e:?}"))?;
+        self.cs.set_low().context("failed to select touch")?;
+        let result = (|| {
+            self.transfer_byte(cmd)?;
+            let hi = self.transfer_byte(0x00)?;
+            let lo = self.transfer_byte(0x00)?;
+            Ok::<u16, anyhow::Error>(((hi as u16) << 8) | lo as u16)
+        })();
+        self.cs.set_high().context("failed to deselect touch")?;
+
         // 12-bit result is in bits [14:3] of the two returned bytes.
-        let value = (((buf[1] as u16) << 8) | buf[2] as u16) >> 3;
-        Ok(value & 0x0FFF)
+        Ok((result? >> 3) & 0x0FFF)
     }
 
     /// Read the raw (uncalibrated) ADC values, averaging several samples to

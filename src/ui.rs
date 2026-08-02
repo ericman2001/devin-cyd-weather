@@ -13,6 +13,7 @@ use embedded_graphics::primitives::{Circle, Line, PrimitiveStyle, Rectangle, Tri
 use embedded_graphics::text::{Alignment, Baseline, Text, TextStyleBuilder};
 
 use crate::display::{HEIGHT, WIDTH};
+use crate::touch::TouchPoint;
 use crate::weather::{aqi_category, uv_category, WeatherData, WeatherIcon};
 
 // -- Palette ----------------------------------------------------------------
@@ -254,6 +255,256 @@ where
         Alignment::Center,
     )?;
     Ok(())
+}
+
+// -- Screens + bottom toolbar ------------------------------------------------
+
+/// Height of the bottom navigation toolbar.
+pub const TOOLBAR_HEIGHT: i32 = 28;
+
+/// Y coordinate of the toolbar's top edge.
+pub const TOOLBAR_TOP: i32 = HEIGHT as i32 - TOOLBAR_HEIGHT;
+
+/// Top of the radar image area on the radar screen.
+pub const RADAR_VIEW_TOP: i32 = 24;
+
+/// The screen currently shown on the panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Screen {
+    #[default]
+    Weather,
+    Radar,
+    Settings,
+}
+
+impl Screen {
+    /// Toolbar buttons, left to right.
+    const TABS: [Screen; 3] = [Screen::Weather, Screen::Radar, Screen::Settings];
+
+    fn label(self) -> &'static str {
+        match self {
+            Screen::Weather => "Weather",
+            Screen::Radar => "Radar",
+            // Drawn as a gear icon instead.
+            Screen::Settings => "",
+        }
+    }
+}
+
+/// Draw the bottom toolbar, highlighting the active screen's button.
+pub fn draw_toolbar<D>(display: &mut D, active: Screen) -> R<D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    let tabs = Screen::TABS.len() as i32;
+    let width = WIDTH as i32 / tabs;
+    for (i, screen) in Screen::TABS.into_iter().enumerate() {
+        let x = i as i32 * width;
+        let selected = screen == active;
+        let fg = if selected { Rgb565::BLACK } else { FG };
+        Rectangle::new(
+            Point::new(x, TOOLBAR_TOP),
+            Size::new(width as u32, TOOLBAR_HEIGHT as u32),
+        )
+        .into_styled(PrimitiveStyle::with_fill(if selected {
+            ACCENT
+        } else {
+            BG
+        }))
+        .draw(display)?;
+        Rectangle::new(
+            Point::new(x, TOOLBAR_TOP),
+            Size::new(width as u32, TOOLBAR_HEIGHT as u32),
+        )
+        .into_styled(PrimitiveStyle::with_stroke(MUTED, 1))
+        .draw(display)?;
+        if screen == Screen::Settings {
+            draw_gear(
+                display,
+                Point::new(x + width / 2, TOOLBAR_TOP + TOOLBAR_HEIGHT / 2),
+                fg,
+            )?;
+        } else {
+            draw_text(
+                display,
+                screen.label(),
+                x + width / 2,
+                TOOLBAR_TOP + 9,
+                &FONT_6X13,
+                fg,
+                Alignment::Center,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Draw a gear glyph centred on `centre`: a ring with four teeth and a hub.
+fn draw_gear<D>(display: &mut D, centre: Point, color: Rgb565) -> R<D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    const R: i32 = 7;
+    for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+        Rectangle::with_center(
+            centre + Point::new(dx * R, dy * R),
+            Size::new(if dx == 0 { 4 } else { 5 }, if dx == 0 { 5 } else { 4 }),
+        )
+        .into_styled(PrimitiveStyle::with_fill(color))
+        .draw(display)?;
+    }
+    Circle::with_center(centre, (R * 2) as u32)
+        .into_styled(PrimitiveStyle::with_stroke(color, 3))
+        .draw(display)?;
+    Circle::with_center(centre, 4)
+        .into_styled(PrimitiveStyle::with_fill(color))
+        .draw(display)
+}
+
+/// Map a touch point to the toolbar button it hit, if any.
+pub fn toolbar_hit(point: TouchPoint) -> Option<Screen> {
+    if point.y < TOOLBAR_TOP || point.y >= HEIGHT as i32 {
+        return None;
+    }
+    let index = point.x * Screen::TABS.len() as i32 / WIDTH as i32;
+    Screen::TABS
+        .get(index.clamp(0, Screen::TABS.len() as i32 - 1) as usize)
+        .copied()
+}
+
+// -- Settings screen ---------------------------------------------------------
+
+/// Top of the first settings row.
+const SETTINGS_TOP: i32 = 34;
+/// Height of one settings row, including the gap below it.
+const SETTINGS_ROW_HEIGHT: i32 = 44;
+
+/// One tappable settings row: what it controls and its current value.
+pub struct SettingsRow<'a> {
+    pub label: &'a str,
+    pub value: &'a str,
+}
+
+/// Draw the settings list. Tapping a row acts on it (toggle, cycle or open a
+/// sub-flow), so the rows are drawn as buttons.
+pub fn draw_settings<D>(display: &mut D, rows: &[SettingsRow<'_>]) -> R<D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    display.clear(BG)?;
+    draw_text(
+        display,
+        "Settings",
+        WIDTH as i32 / 2,
+        8,
+        &FONT_10X20,
+        ACCENT,
+        Alignment::Center,
+    )?;
+
+    for (i, row) in rows.iter().enumerate() {
+        let y = SETTINGS_TOP + i as i32 * SETTINGS_ROW_HEIGHT;
+        Rectangle::new(
+            Point::new(6, y),
+            Size::new(WIDTH as u32 - 12, SETTINGS_ROW_HEIGHT as u32 - 6),
+        )
+        .into_styled(PrimitiveStyle::with_stroke(MUTED, 1))
+        .draw(display)?;
+        draw_text(
+            display,
+            row.label,
+            14,
+            y + 6,
+            &FONT_6X13,
+            MUTED,
+            Alignment::Left,
+        )?;
+        draw_text(
+            display,
+            row.value,
+            14,
+            y + 20,
+            &FONT_10X20,
+            FG,
+            Alignment::Left,
+        )?;
+    }
+    Ok(())
+}
+
+/// Map a touch point to the settings row it hit, if any.
+pub fn settings_row_hit(point: TouchPoint, rows: usize) -> Option<usize> {
+    if point.y < SETTINGS_TOP || point.y >= TOOLBAR_TOP {
+        return None;
+    }
+    let index = ((point.y - SETTINGS_TOP) / SETTINGS_ROW_HEIGHT) as usize;
+    (index < rows).then_some(index)
+}
+
+/// Draw the static parts of the radar screen (title + status line area).
+///
+/// The radar frames themselves are streamed straight from the SD card into the
+/// panel by `radar::blit_frame`, bypassing `embedded-graphics` entirely.
+pub fn draw_radar_chrome<D>(display: &mut D, title: &str, status: &str) -> R<D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    clear(display)?;
+    draw_text(
+        display,
+        title,
+        WIDTH as i32 / 2,
+        4,
+        &FONT_6X13,
+        ACCENT,
+        Alignment::Center,
+    )?;
+    draw_radar_status(display, status)
+}
+
+/// Update just the radar title line above the view.
+pub fn draw_radar_title<D>(display: &mut D, title: &str) -> R<D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    Rectangle::new(
+        Point::new(0, 0),
+        Size::new(WIDTH as u32, RADAR_VIEW_TOP as u32),
+    )
+    .into_styled(PrimitiveStyle::with_fill(BG))
+    .draw(display)?;
+    draw_text(
+        display,
+        title,
+        WIDTH as i32 / 2,
+        4,
+        &FONT_6X13,
+        ACCENT,
+        Alignment::Center,
+    )
+}
+
+/// Update just the status line below the radar view.
+pub fn draw_radar_status<D>(display: &mut D, status: &str) -> R<D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    let top = TOOLBAR_TOP - 20;
+    Rectangle::new(
+        Point::new(0, top),
+        Size::new(WIDTH as u32, (TOOLBAR_TOP - top) as u32),
+    )
+    .into_styled(PrimitiveStyle::with_fill(BG))
+    .draw(display)?;
+    draw_text(
+        display,
+        status,
+        WIDTH as i32 / 2,
+        top + 4,
+        &FONT_6X10,
+        MUTED,
+        Alignment::Center,
+    )
 }
 
 /// Render an error banner over the (possibly stale) weather screen.

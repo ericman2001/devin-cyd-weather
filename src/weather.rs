@@ -13,6 +13,9 @@ use crate::config::{AIR_QUALITY_API_BASE, FORECAST_API_BASE, FORECAST_DAYS};
 struct ForecastResponse {
     current: CurrentBlock,
     daily: DailyBlock,
+    /// Offset of the location's local time from UTC (`timezone=auto`).
+    #[serde(default)]
+    utc_offset_seconds: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,6 +73,9 @@ pub struct WeatherData {
     /// Current UV index. `None` when the air-quality API had no value.
     pub uv_index: Option<f32>,
     pub daily: Vec<DailyForecast>,
+    /// Offset of the location's local time from UTC, used to label radar frames
+    /// without a synchronised clock on the device.
+    pub utc_offset_seconds: i64,
 }
 
 /// Human-readable weather condition mapped from a WMO weather code.
@@ -218,6 +224,7 @@ pub fn fetch(lat: f64, lon: f64) -> Result<WeatherData> {
         us_aqi,
         uv_index,
         daily,
+        utc_offset_seconds: forecast.utc_offset_seconds,
     })
 }
 

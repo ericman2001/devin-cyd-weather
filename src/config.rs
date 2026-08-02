@@ -34,6 +34,82 @@ pub const GEOLOCATION_API: &str = "http://ip-api.com/json/";
 /// Number of forecast days to request / render.
 pub const FORECAST_DAYS: usize = 4;
 
+// ---------------------------------------------------------------------------
+// Radar slideshow
+// ---------------------------------------------------------------------------
+
+/// RainViewer frame index: lists the available past + nowcast radar tile paths.
+///
+/// Open-Meteo has no radar imagery, so the radar source is deliberately
+/// separate (and pluggable, see `radar::RadarSource`).
+pub const RAINVIEWER_INDEX_API: &str = "https://api.rainviewer.com/public/weather-maps.json";
+
+/// Cap on the RainViewer index JSON we buffer in RAM.
+pub const RAINVIEWER_INDEX_MAX_BYTES: usize = 16 * 1024;
+
+/// Cap on a single downloaded radar tile (streamed to the SD card, never RAM).
+pub const RADAR_TILE_MAX_BYTES: usize = 256 * 1024;
+
+/// Slippy-map zoom level of the radar tiles (~150 km across at zoom 6).
+pub const RADAR_ZOOM: u8 = 6;
+
+/// RainViewer colour scheme id (4 = "Universal Blue").
+pub const RADAR_COLOR_SCHEME: u8 = 4;
+
+/// Basemap tile drawn underneath the radar so the precipitation has
+/// recognisable coastlines, roads and place labels behind it. `{z}`/`{x}`/`{y}`
+/// are substituted with the same slippy-map coordinates as the radar tile.
+/// CARTO's dark basemap, rendered from OpenStreetMap data (attribution is shown
+/// on the radar screen).
+pub const BASEMAP_TILE_URL: &str = "https://basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png";
+
+/// Attribution for the radar and basemap tiles, shown on the radar screen.
+pub const RADAR_ATTRIBUTION: &str = "RainViewer/HRRR-IEM/OSM";
+
+/// Forecast ("future radar") tiles: NCEP HRRR 1000 m simulated reflectivity,
+/// rendered by the Iowa Environmental Mesonet. `{f}` is the forecast minute
+/// (four digits, 15-minute steps) and `{init}` the model run (`YYYYMMDDHHMM`).
+/// CONUS only — outside it the tiles are simply empty.
+pub const HRRR_TILE_URL: &str =
+    "https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/hrrr::REFD-F{f}-{init}/{z}/{x}/{y}.png";
+
+/// Metadata for the newest HRRR run the IEM has processed; forecast minutes are
+/// measured from its `model_init_utc`.
+pub const HRRR_META_URL: &str =
+    "https://mesonet.agron.iastate.edu/data/gis/images/4326/hrrr/refd_1080.json";
+
+/// Cap on the HRRR metadata JSON we buffer in RAM.
+pub const HRRR_META_MAX_BYTES: usize = 1024;
+
+/// Step between forecast frames. HRRR is published on a 15-minute grid, so
+/// this should stay a multiple of 15.
+pub const RADAR_FORECAST_STEP_MINUTES: i64 = 15;
+
+/// Default forecast horizon; user-adjustable on the settings screen.
+pub const RADAR_FORECAST_MINUTES_DEFAULT: u16 = 30;
+
+/// Forecast horizons offered on the settings screen, in minutes (0 = past
+/// frames only).
+pub const RADAR_FORECAST_CHOICES: [u16; 5] = [0, 15, 30, 60, 90];
+
+/// Number of past frames shown before the forecast ones.
+pub const RADAR_PAST_FRAME_COUNT: usize = 4;
+
+/// Upper bound on the frames staged on the SD card, so the forecast horizon
+/// cannot grow the download unboundedly.
+pub const RADAR_MAX_FRAMES: usize = 10;
+
+/// Size of the radar view area on the panel, in pixels.
+pub const RADAR_VIEW_WIDTH: u16 = 240;
+pub const RADAR_VIEW_HEIGHT: u16 = 240;
+
+/// Dwell time per radar frame during the slideshow.
+pub const RADAR_FRAME_MS: u64 = 600;
+
+/// How often the staged radar frames are re-downloaded while the radar screen
+/// is in use.
+pub const RADAR_REFRESH_SECS: u64 = 10 * 60;
+
 // NVS namespace + key names.
 const NVS_NAMESPACE: &str = "cydweather";
 const KEY_SSID: &str = "ssid";
@@ -42,6 +118,8 @@ const KEY_AUTH: &str = "auth";
 const KEY_DEBUG: &str = "debug";
 const KEY_LAT: &str = "lat";
 const KEY_LON: &str = "lon";
+const KEY_FORECAST: &str = "fcstmin";
+const KEY_MODEL_PAST: &str = "mdlpast";
 
 // ---------------------------------------------------------------------------
 // Wi-Fi security / authentication method
@@ -138,6 +216,12 @@ pub struct StoredConfig {
     /// Optional manual latitude/longitude override. When present it takes
     /// precedence over IP-based geolocation.
     pub manual_location: Option<(f64, f64)>,
+    /// How far ahead the radar animation forecasts, in minutes.
+    pub radar_forecast_minutes: u16,
+    /// Draw the past half of the animation from the HRRR model too, so the
+    /// whole loop shares one source and colour ramp, instead of using measured
+    /// RainViewer radar.
+    pub radar_model_past: bool,
 }
 
 impl Default for StoredConfig {
@@ -148,6 +232,8 @@ impl Default for StoredConfig {
             auth_method: WifiAuth::default(),
             serial_debug: true,
             manual_location: None,
+            radar_forecast_minutes: RADAR_FORECAST_MINUTES_DEFAULT,
+            radar_model_past: false,
         }
     }
 }
@@ -205,12 +291,22 @@ impl ConfigStore {
             (Some(la), Some(lo)) => Some((la, lo)),
             _ => None,
         };
+        let radar_forecast_minutes = self
+            .get_string(KEY_FORECAST)?
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(RADAR_FORECAST_MINUTES_DEFAULT);
+        let radar_model_past = self
+            .get_string(KEY_MODEL_PAST)?
+            .map(|s| matches!(s.as_str(), "1" | "true"))
+            .unwrap_or(false);
         Ok(StoredConfig {
             ssid,
             password,
             auth_method,
             serial_debug,
             manual_location,
+            radar_forecast_minutes,
+            radar_model_past,
         })
     }
 
@@ -228,6 +324,12 @@ impl ConfigStore {
         self.nvs
             .set_str(KEY_DEBUG, if cfg.serial_debug { "1" } else { "0" })
             .context("failed to write debug flag")?;
+        self.nvs
+            .set_str(KEY_FORECAST, &cfg.radar_forecast_minutes.to_string())
+            .context("failed to write the radar forecast horizon")?;
+        self.nvs
+            .set_str(KEY_MODEL_PAST, if cfg.radar_model_past { "1" } else { "0" })
+            .context("failed to write the radar past-frame source")?;
         match cfg.manual_location {
             Some((lat, lon)) => {
                 self.nvs.set_str(KEY_LAT, &lat.to_string())?;
@@ -250,6 +352,8 @@ impl ConfigStore {
             KEY_DEBUG,
             KEY_LAT,
             KEY_LON,
+            KEY_FORECAST,
+            KEY_MODEL_PAST,
         ] {
             let _ = self.nvs.remove(key);
         }

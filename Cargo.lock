@@ -342,6 +342,7 @@ dependencies = [
  "esp-idf-sys",
  "heapless 0.8.0",
  "log",
+ "miniz_oxide",
  "mipidsi",
  "serde",
  "serde_json",
