@@ -85,6 +85,47 @@ fn basemap_tile_path(part: usize) -> PathBuf {
     storage::path(&format!("{FRAME_DIR}/base_{part}.png"))
 }
 
+/// Path of the sidecar listing the timestamp of each staged frame.
+fn times_path() -> PathBuf {
+    storage::path(&format!("{FRAME_DIR}/times.txt"))
+}
+
+/// When a staged frame was observed, or is forecast for.
+#[derive(Debug, Clone, Copy)]
+pub struct FrameTime {
+    /// Unix timestamp of the frame.
+    pub time: i64,
+    /// True for nowcast frames, which are a prediction rather than a scan.
+    pub forecast: bool,
+}
+
+/// Times of the staged frames, in animation order. Empty when they are
+/// unknown, e.g. for frames staged by an older firmware.
+pub fn frame_times() -> Vec<FrameTime> {
+    let Ok(body) = std::fs::read_to_string(times_path()) else {
+        return Vec::new();
+    };
+    body.lines()
+        .filter_map(|line| {
+            let (time, forecast) = line.trim().split_once(',')?;
+            Some(FrameTime {
+                time: time.parse().ok()?,
+                forecast: forecast == "1",
+            })
+        })
+        .collect()
+}
+
+fn write_times(times: &[FrameTime]) {
+    let body: String = times
+        .iter()
+        .map(|t| format!("{},{}\n", t.time, u8::from(t.forecast)))
+        .collect();
+    if let Err(e) = std::fs::write(times_path(), body) {
+        log::warn!("failed to record the radar frame times: {e:#}");
+    }
+}
+
 /// Path of the decoded basemap frame for `view`.
 fn basemap_frame_path(view: &View) -> PathBuf {
     storage::path(&format!(
@@ -124,12 +165,20 @@ pub fn staged_frames() -> usize {
 // Tile sources
 // ---------------------------------------------------------------------------
 
-/// A pluggable source of radar tile URLs, oldest first.
+/// One animation frame offered by a [`RadarSource`].
+pub struct FrameSpec {
+    /// Tile URL template containing the `{z}`, `{x}` and `{y}` placeholders,
+    /// because one frame is stitched from several tiles.
+    pub url_template: String,
+    /// When the frame was observed, or is forecast for.
+    pub time: FrameTime,
+}
+
+/// A pluggable source of radar frames, oldest first.
 pub trait RadarSource {
-    /// Return up to `max_frames` tile URL templates, ordered oldest-first so
-    /// they animate forwards. Each template contains the `{z}`, `{x}` and `{y}`
-    /// placeholders, because one frame is stitched from several tiles.
-    fn frame_url_templates(&self, max_frames: usize) -> Result<Vec<String>>;
+    /// Return up to `max_frames` frames, ordered oldest-first so they animate
+    /// forwards.
+    fn frames(&self, max_frames: usize) -> Result<Vec<FrameSpec>>;
 }
 
 /// RainViewer public radar tiles (past observations + nowcast).
@@ -162,10 +211,12 @@ struct RvRadar {
 #[derive(Deserialize)]
 struct RvFrame {
     path: String,
+    #[serde(default)]
+    time: i64,
 }
 
 impl RadarSource for RainViewer {
-    fn frame_url_templates(&self, max_frames: usize) -> Result<Vec<String>> {
+    fn frames(&self, max_frames: usize) -> Result<Vec<FrameSpec>> {
         let body = crate::http::get(RAINVIEWER_INDEX_API, RAINVIEWER_INDEX_MAX_BYTES)
             .context("failed to fetch the RainViewer frame index")?;
         let index: RvIndex =
@@ -173,23 +224,27 @@ impl RadarSource for RainViewer {
 
         // Newest observations first, then the nowcast, then trim to the frame
         // budget and flip back to chronological order.
-        let mut paths: Vec<&str> = Vec::new();
-        paths.extend(index.radar.nowcast.iter().rev().map(|f| f.path.as_str()));
-        paths.extend(index.radar.past.iter().rev().map(|f| f.path.as_str()));
-        paths.truncate(max_frames);
-        paths.reverse();
+        let mut frames: Vec<(&RvFrame, bool)> = Vec::new();
+        frames.extend(index.radar.nowcast.iter().rev().map(|f| (f, true)));
+        frames.extend(index.radar.past.iter().rev().map(|f| (f, false)));
+        frames.truncate(max_frames);
+        frames.reverse();
 
-        if paths.is_empty() {
+        if frames.is_empty() {
             bail!("the RainViewer index contained no radar frames");
         }
 
-        Ok(paths
+        Ok(frames
             .into_iter()
-            .map(|path| {
-                format!(
+            .map(|(frame, forecast)| FrameSpec {
+                url_template: format!(
                     "{}{}/{}/{{z}}/{{x}}/{{y}}/{}/1_1.png",
-                    index.host, path, TILE_SIZE, self.color_scheme
-                )
+                    index.host, frame.path, TILE_SIZE, self.color_scheme
+                ),
+                time: FrameTime {
+                    time: frame.time,
+                    forecast,
+                },
             })
             .collect())
     }
@@ -503,13 +558,19 @@ pub fn download_tiles(source: &dyn RadarSource, lat: f64, lon: f64) -> Result<us
 
     let view = View::centered_on(lat, lon, RADAR_ZOOM);
     let placements = view.tiles();
-    let templates = source.frame_url_templates(RADAR_FRAME_COUNT)?;
+    let frames = source.frames(RADAR_FRAME_COUNT)?;
 
+    let mut times = Vec::with_capacity(frames.len());
     let mut staged = 0usize;
-    for template in templates.iter() {
+    for frame in frames.iter() {
         let mut parts = 0usize;
         for (part, placement) in placements.iter().enumerate() {
-            let url = tile_url(template, view.zoom, placement.tile_x, placement.tile_y);
+            let url = tile_url(
+                &frame.url_template,
+                view.zoom,
+                placement.tile_x,
+                placement.tile_y,
+            );
             let path = tile_path(staged, part);
             match download_tile(&url, &path) {
                 Ok(()) => parts += 1,
@@ -521,12 +582,14 @@ pub fn download_tiles(source: &dyn RadarSource, lat: f64, lon: f64) -> Result<us
         }
         if parts > 0 {
             staged += 1;
+            times.push(frame.time);
         }
     }
 
     if staged == 0 {
         bail!("no radar tiles could be downloaded");
     }
+    write_times(&times);
     log::info!("downloaded {staged} radar frames to the SD card");
 
     // The basemap never changes, so it is only fetched when the frame cached
@@ -570,6 +633,8 @@ pub fn decode_tiles(count: usize, lat: f64, lon: f64) -> Result<usize> {
     let placements = view.tiles();
     let base = prepare_basemap(&view, &placements);
 
+    let downloaded = frame_times();
+    let mut times = Vec::with_capacity(count);
     let mut staged = 0usize;
     for i in 0..count {
         let tiles: Vec<(Placement, PathBuf)> = placements
@@ -580,7 +645,12 @@ pub fn decode_tiles(count: usize, lat: f64, lon: f64) -> Result<usize> {
 
         match compose_frame(&frame_path(staged), &view, &tiles, base.as_deref(), true) {
             Ok(0) => log::warn!("radar frame {i} had no usable tiles"),
-            Ok(_) => staged += 1,
+            Ok(_) => {
+                staged += 1;
+                if let Some(time) = downloaded.get(i) {
+                    times.push(*time);
+                }
+            }
             Err(e) => log::warn!("composing radar frame {i} failed: {e:#}"),
         }
         for (_, tile) in tiles {
@@ -592,6 +662,7 @@ pub fn decode_tiles(count: usize, lat: f64, lon: f64) -> Result<usize> {
     for i in staged..RADAR_FRAME_COUNT {
         let _ = std::fs::remove_file(frame_path(i));
     }
+    write_times(&times);
 
     log_heap("after decode");
     if staged == 0 {

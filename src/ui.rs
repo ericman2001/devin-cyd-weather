@@ -356,6 +356,28 @@ where
     draw_radar_status(display, status)
 }
 
+/// Update just the radar title line above the view.
+pub fn draw_radar_title<D>(display: &mut D, title: &str) -> R<D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    Rectangle::new(
+        Point::new(0, 0),
+        Size::new(WIDTH as u32, RADAR_VIEW_TOP as u32),
+    )
+    .into_styled(PrimitiveStyle::with_fill(BG))
+    .draw(display)?;
+    draw_text(
+        display,
+        title,
+        WIDTH as i32 / 2,
+        4,
+        &FONT_6X13,
+        ACCENT,
+        Alignment::Center,
+    )
+}
+
 /// Update just the status line below the radar view.
 pub fn draw_radar_status<D>(display: &mut D, status: &str) -> R<D::Error>
 where

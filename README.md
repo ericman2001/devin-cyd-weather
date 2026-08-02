@@ -209,6 +209,12 @@ renders, just over a flat background. A crosshair marks the configured
 location, and the status line carries the `RainViewer / OSM / CARTO`
 attribution.
 
+Each frame's observation time (from the RainViewer index, recorded alongside
+the frames in `/sdcard/radar/times.txt`) is shown in the radar title, e.g.
+`Radar  7:15 PM`, with nowcast frames marked `fcst`. The board has no clock, so
+the timestamps are rendered in local time using the `utc_offset_seconds` the
+forecast API reports for your coordinates.
+
 ### View geometry
 
 `radar::View` is a 240x240 window in slippy-map *pixel* space centred on the

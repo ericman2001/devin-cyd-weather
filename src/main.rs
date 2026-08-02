@@ -272,6 +272,11 @@ struct RadarState {
     /// Time left on the current frame's dwell, in ms.
     dwell_ms: u64,
     staged_at: Option<Instant>,
+    /// Observation (or nowcast) time of each staged frame.
+    times: Vec<radar::FrameTime>,
+    /// Local time offset from UTC, learned from the forecast API. The board has
+    /// no clock of its own, so frame times cannot be labelled without it.
+    utc_offset: Option<i64>,
 }
 
 impl RadarState {
@@ -307,6 +312,8 @@ fn run_refresh_loop(
             index: 0,
             dwell_ms: 0,
             staged_at: None,
+            times: Vec::new(),
+            utc_offset: None,
         },
     };
 
@@ -315,6 +322,7 @@ fn run_refresh_loop(
 
         let sleep_secs = match weather::fetch(location.latitude, location.longitude) {
             Ok(data) => {
+                state.radar.utc_offset = Some(data.utc_offset_seconds);
                 last_good = Some(data);
                 if state.screen == Screen::Weather {
                     draw_weather_screen(dev.disp, last_good.as_ref(), &location, false);
@@ -379,6 +387,7 @@ fn enter_radar_screen(dev: &mut Devices, state: &mut AppState, location: &Locati
             Err(e) => {
                 log::warn!("radar refresh failed: {e:#}");
                 state.radar.frames = radar::staged_frames();
+                state.radar.times = radar::frame_times();
             }
         }
     }
@@ -397,7 +406,21 @@ fn enter_radar_screen(dev: &mut Devices, state: &mut AppState, location: &Locati
 fn refresh_radar(dev: &mut Devices, state: &mut AppState, location: &Location) -> Result<usize> {
     let tiles = radar::download_tiles(&state.radar.source, location.latitude, location.longitude)?;
     ui::draw_radar_status(dev.disp, "Decoding...").ok();
-    radar::decode_tiles(tiles, location.latitude, location.longitude)
+    let frames = radar::decode_tiles(tiles, location.latitude, location.longitude)?;
+    state.radar.times = radar::frame_times();
+    Ok(frames)
+}
+
+/// Format a Unix timestamp as a local 12-hour clock time (e.g. `7:15 PM`).
+fn local_clock(unix: i64, utc_offset: i64) -> String {
+    let minute_of_day = (unix + utc_offset).rem_euclid(86_400) / 60;
+    let hour = minute_of_day / 60;
+    let suffix = if hour < 12 { "AM" } else { "PM" };
+    let hour12 = match hour % 12 {
+        0 => 12,
+        h => h,
+    };
+    format!("{hour12}:{:02} {suffix}", minute_of_day % 60)
 }
 
 /// Stream the current radar frame from the SD card onto the panel.
@@ -410,6 +433,18 @@ fn show_radar_frame(disp: &mut CydDisplay, state: &mut AppState) {
         state.radar.frames = 0;
         return;
     }
+    let stamp = state
+        .radar
+        .utc_offset
+        .zip(state.radar.times.get(index))
+        .map(|(offset, frame)| {
+            let clock = local_clock(frame.time, offset);
+            let kind = if frame.forecast { " fcst" } else { "" };
+            format!("Radar  {clock}{kind}")
+        });
+    let title = stamp.unwrap_or_else(|| "Radar".to_string());
+    ui::draw_radar_title(disp, &title).ok();
+
     let label = format!(
         "Frame {}/{}  {RADAR_ATTRIBUTION}",
         index + 1,
