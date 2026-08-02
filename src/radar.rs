@@ -33,8 +33,10 @@ use embedded_graphics::pixelcolor::raw::RawU16;
 use embedded_graphics::pixelcolor::Rgb565;
 use serde::Deserialize;
 
+use crate::clock;
 use crate::config::{
-    BASEMAP_TILE_URL, RADAR_COLOR_SCHEME, RADAR_FRAME_COUNT, RADAR_TILE_MAX_BYTES,
+    BASEMAP_TILE_URL, HRRR_META_MAX_BYTES, HRRR_META_URL, HRRR_TILE_URL, RADAR_COLOR_SCHEME,
+    RADAR_FORECAST_MINUTES, RADAR_FORECAST_STEP_MINUTES, RADAR_FRAME_COUNT, RADAR_TILE_MAX_BYTES,
     RADAR_VIEW_HEIGHT, RADAR_VIEW_WIDTH, RADAR_ZOOM, RAINVIEWER_INDEX_API,
     RAINVIEWER_INDEX_MAX_BYTES,
 };
@@ -247,6 +249,122 @@ impl RadarSource for RainViewer {
                 },
             })
             .collect())
+    }
+}
+
+/// Forecast radar: NCEP HRRR simulated reflectivity, rendered as slippy-map
+/// tiles by the Iowa Environmental Mesonet. Only covers CONUS.
+#[derive(Default)]
+pub struct HrrrForecast;
+
+#[derive(Deserialize)]
+struct HrrrMeta {
+    /// Model run the forecast minutes are measured from, e.g.
+    /// `2026-08-01T23:00:00Z`.
+    model_init_utc: String,
+}
+
+/// Longest forecast the IEM publishes, in minutes.
+const HRRR_MAX_MINUTE: i64 = 1080;
+
+impl RadarSource for HrrrForecast {
+    fn frames(&self, max_frames: usize) -> Result<Vec<FrameSpec>> {
+        let now = clock::now_unix().context("the clock is not synchronised")?;
+        let body = crate::http::get(HRRR_META_URL, HRRR_META_MAX_BYTES)
+            .context("failed to fetch the HRRR run metadata")?;
+        let meta: HrrrMeta =
+            serde_json::from_str(&body).context("failed to parse the HRRR run metadata")?;
+        let init = parse_utc_timestamp(&meta.model_init_utc)?;
+        let run: String = meta
+            .model_init_utc
+            .chars()
+            .filter(char::is_ascii_digit)
+            .take(12)
+            .collect();
+
+        let step = RADAR_FORECAST_STEP_MINUTES * 60;
+        let mut frames = Vec::new();
+        for k in 1..=max_frames as i64 {
+            // Snap onto the model's 15-minute grid, always ahead of now.
+            let valid = (now / step + k) * step;
+            let minute = (valid - init) / 60;
+            if !(0..=HRRR_MAX_MINUTE).contains(&minute) {
+                continue;
+            }
+            frames.push(FrameSpec {
+                url_template: HRRR_TILE_URL
+                    .replace("{f}", &format!("{minute:04}"))
+                    .replace("{init}", &run),
+                time: FrameTime {
+                    time: valid,
+                    forecast: true,
+                },
+            });
+        }
+
+        if frames.is_empty() {
+            bail!("the HRRR run from {} is too old to forecast from", run);
+        }
+        Ok(frames)
+    }
+}
+
+/// Parse an ISO-8601 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`) into Unix seconds.
+fn parse_utc_timestamp(text: &str) -> Result<i64> {
+    let digits: Vec<u32> = text.chars().filter_map(|c| c.to_digit(10)).collect();
+    if digits.len() < 12 {
+        bail!("{text:?} is not an ISO-8601 UTC timestamp");
+    }
+    let number = |start: usize, len: usize| -> i64 {
+        digits[start..start + len]
+            .iter()
+            .fold(0i64, |acc, d| acc * 10 + *d as i64)
+    };
+    let (year, month, day) = (number(0, 4), number(4, 2), number(6, 2));
+    let (hour, minute) = (number(8, 2), number(10, 2));
+    let second = if digits.len() >= 14 { number(12, 2) } else { 0 };
+    Ok(days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+/// Days between 1970-01-01 and the given proleptic Gregorian date (Howard
+/// Hinnant's `days_from_civil`).
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// The bundled pipeline: observed RainViewer frames followed by HRRR forecast
+/// frames, so the animation runs from the recent past into the near future.
+#[derive(Default)]
+pub struct ObservedThenForecast {
+    pub observed: RainViewer,
+    pub forecast: HrrrForecast,
+}
+
+impl RadarSource for ObservedThenForecast {
+    fn frames(&self, max_frames: usize) -> Result<Vec<FrameSpec>> {
+        let wanted = (RADAR_FORECAST_MINUTES / RADAR_FORECAST_STEP_MINUTES) as usize;
+        let mut frames = match self.observed.frames(max_frames.saturating_sub(wanted)) {
+            Ok(frames) => frames,
+            Err(e) => {
+                log::warn!("observed radar unavailable: {e:#}");
+                Vec::new()
+            }
+        };
+        match self.forecast.frames(wanted) {
+            Ok(forecast) => frames.extend(forecast),
+            Err(e) => log::warn!("forecast radar unavailable: {e:#}"),
+        }
+
+        if frames.is_empty() {
+            bail!("no radar frames are available");
+        }
+        Ok(frames)
     }
 }
 

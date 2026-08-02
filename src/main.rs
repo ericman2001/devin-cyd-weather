@@ -10,6 +10,7 @@
 //!      data on transient failures, while the bottom toolbar switches between
 //!      the weather summary and the radar slideshow.
 
+mod clock;
 mod config;
 mod display;
 mod http;
@@ -37,7 +38,7 @@ use crate::config::{
 };
 use crate::display::{Backlight, CydDisplay};
 use crate::location::Location;
-use crate::radar::RainViewer;
+use crate::radar::ObservedThenForecast;
 use crate::touch::{Calibration, Touch};
 use crate::ui::Screen;
 use crate::weather::WeatherData;
@@ -145,6 +146,20 @@ fn main() -> Result<()> {
             }
         }
     }
+
+    // -- Clock --------------------------------------------------------------
+    // The forecast radar addresses its tiles by forecast minute, so it needs to
+    // know what time it is; the board has no RTC.
+    let _clock = match clock::Clock::start() {
+        Ok(clock) => {
+            clock.wait_for_sync(std::time::Duration::from_secs(10));
+            Some(clock)
+        }
+        Err(e) => {
+            log::warn!("clock unavailable: {e:#}; forecast radar frames are disabled");
+            None
+        }
+    };
 
     // -- Location -----------------------------------------------------------
     let location = resolve_location(&mut disp, &cfg);
@@ -264,7 +279,7 @@ struct AppState {
 
 /// Radar slideshow bookkeeping.
 struct RadarState {
-    source: RainViewer,
+    source: ObservedThenForecast,
     /// False when no SD card is mounted; the radar screen then just says so.
     sd_ready: bool,
     frames: usize,
@@ -306,7 +321,7 @@ fn run_refresh_loop(
         remaining_on_ms: 0,
         touch_down: false,
         radar: RadarState {
-            source: RainViewer::default(),
+            source: ObservedThenForecast::default(),
             sd_ready,
             frames: 0,
             index: 0,

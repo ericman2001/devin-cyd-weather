@@ -64,10 +64,34 @@ pub const RADAR_COLOR_SCHEME: u8 = 4;
 pub const BASEMAP_TILE_URL: &str = "https://basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png";
 
 /// Attribution for the radar and basemap tiles, shown on the radar screen.
-pub const RADAR_ATTRIBUTION: &str = "RainViewer / OSM / CARTO";
+pub const RADAR_ATTRIBUTION: &str = "RainViewer/HRRR-IEM/OSM";
+
+/// Forecast ("future radar") tiles: NCEP HRRR 1000 m simulated reflectivity,
+/// rendered by the Iowa Environmental Mesonet. `{f}` is the forecast minute
+/// (four digits, 15-minute steps) and `{init}` the model run (`YYYYMMDDHHMM`).
+/// CONUS only — outside it the tiles are simply empty.
+pub const HRRR_TILE_URL: &str =
+    "https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/hrrr::REFD-F{f}-{init}/{z}/{x}/{y}.png";
+
+/// Metadata for the newest HRRR run the IEM has processed; forecast minutes are
+/// measured from its `model_init_utc`.
+pub const HRRR_META_URL: &str =
+    "https://mesonet.agron.iastate.edu/data/gis/images/4326/hrrr/refd_1080.json";
+
+/// Cap on the HRRR metadata JSON we buffer in RAM.
+pub const HRRR_META_MAX_BYTES: usize = 1024;
+
+/// How far ahead the forecast frames run, and the step between them. HRRR is
+/// published on a 15-minute grid, so the step should stay a multiple of 15.
+pub const RADAR_FORECAST_MINUTES: i64 = 30;
+pub const RADAR_FORECAST_STEP_MINUTES: i64 = 15;
+
+/// Number of observed (RainViewer) frames shown before the forecast ones.
+pub const RADAR_PAST_FRAME_COUNT: usize = 4;
 
 /// Number of radar frames staged on the SD card and animated.
-pub const RADAR_FRAME_COUNT: usize = 6;
+pub const RADAR_FRAME_COUNT: usize =
+    RADAR_PAST_FRAME_COUNT + (RADAR_FORECAST_MINUTES / RADAR_FORECAST_STEP_MINUTES) as usize;
 
 /// Size of the radar view area on the panel, in pixels.
 pub const RADAR_VIEW_WIDTH: u16 = 240;

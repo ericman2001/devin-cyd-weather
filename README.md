@@ -228,15 +228,36 @@ rather than finished URLs.
 
 Heap headroom is logged around both phases (`heap[before download]`,
 `heap[before decode]`, `heap[after decode]`), and `sdkconfig.defaults` enables
-mbedTLS dynamic buffers and trims the Wi-Fi buffer pools to keep the margin.
+mbedTLS dynamic buffers so TLS I/O buffers are freed between handshakes.
 
-### Changing the radar source
+### Radar sources: observed past + forecast future
 
-Open-Meteo does not serve radar imagery, so the tile source is pluggable:
-implement `radar::RadarSource` (one method returning tile URLs, oldest first)
-and pass it to `radar::download_tiles`. The bundled implementation is
-`radar::RainViewer`. Zoom level, colour scheme, frame count, dwell time and the
-refresh interval are constants in `src/config.rs`.
+The slideshow runs from the recent past into the near future, and each half
+comes from a different service:
+
+* **Observed** frames are RainViewer composite radar (2 hours of past data at
+  10-minute steps). Its free API no longer serves nowcast frames, so it cannot
+  provide the future.
+* **Forecast** frames are NCEP HRRR "1000 m simulated reflectivity" rendered as
+  slippy-map tiles by the [Iowa Environmental
+  Mesonet](https://mesonet.agron.iastate.edu/GIS/model.phtml). Tiles are
+  addressed by *forecast minute* relative to a model run, so the firmware reads
+  the run's metadata JSON and works out which minutes correspond to the next
+  `RADAR_FORECAST_MINUTES` (default 30, in 15-minute steps). This is a model
+  prediction, not a measurement, and it covers **CONUS only** — elsewhere the
+  forecast frames come back empty.
+
+Forecast frames therefore need to know the current time, which the board has no
+RTC for: `src/clock.rs` starts SNTP after Wi-Fi comes up, and the forecast half
+is skipped (with the observed half still shown) if the clock never syncs.
+
+Open-Meteo serves no radar imagery, so sources are pluggable: implement
+`radar::RadarSource` (one method returning tile URL templates with `{z}`/`{x}`/
+`{y}`, oldest first) and pass it to `radar::download_tiles`. The bundled
+implementations are `radar::RainViewer`, `radar::HrrrForecast` and
+`radar::ObservedThenForecast`, which chains the two. Zoom level, colour scheme,
+frame counts, forecast horizon, dwell time and the refresh interval are
+constants in `src/config.rs`.
 
 ## Touch calibration
 
@@ -256,6 +277,7 @@ flags there.
 | `src/storage.rs` | SD card (SDSPI) + FAT filesystem mounted at `/sdcard` |
 | `src/radar.rs` | Radar tile sources, row-wise decoder, frame streaming |
 | `src/png_stream.rs` | Heap-free scanline PNG reader (static 32 KiB inflate window) |
+| `src/clock.rs` | SNTP time sync, needed to address forecast radar frames |
 | `src/wifi.rs` | Station scan/connect |
 | `src/provisioning.rs` | Touch setup UI (list, keyboard, keypad) |
 | `src/location.rs` | IP geolocation |
