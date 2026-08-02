@@ -176,10 +176,10 @@ can spare while Wi-Fi and TLS are up — so no stage ever holds a whole image:
 1. **Download -> SD.** `radar::download_tiles` / `http::get_to_writer` stream
    the HTTP body straight into a file on the card through a 512-byte buffer.
 2. **Row-wise decode -> SD.** `radar::decode_tiles` decodes each PNG one
-   scanline at a time (incremental `png` reader), crops/downsamples that row to
-   the 240x240 view, converts it to Rgb565 and appends it to
-   `/sdcard/radar/frame_{i}.rgb565`. Only one source row plus one output row is
-   in RAM.
+   scanline at a time, crops that row to the 240x240 view, composites it over
+   the matching basemap row (read from the card, see below), converts it to
+   Rgb565 and appends it to `/sdcard/radar/frame_{i}.rgb565`. Only a couple of
+   rows are in RAM.
 3. **Stream -> display.** `radar::blit_frame` reads a staged frame back in
    4-row bands and pushes each band into a `mipidsi` address window, so the
    panel is fed from the SD card with no framebuffer. This path bypasses the
@@ -196,6 +196,18 @@ inflate core over a window and inflate state reserved statically in `.bss`, so
 decoding costs no heap beyond two scanline buffers and cannot OOM. It handles
 non-interlaced 8-bit greyscale/RGB/RGBA and 1/2/4/8-bit palette (with `tRNS`)
 images — the shapes radar tiles come in.
+
+### Basemap and location marker
+
+Radar alone is hard to read, so each frame is composited over a basemap tile
+(`config::BASEMAP_TILE_URL`, CARTO's dark style rendered from OpenStreetMap
+data) for the same z/x/y — coastlines, roads and place labels. The basemap is
+decoded once into `/sdcard/radar/base_{z}_{x}_{y}_{cropx}_{cropy}.rgb565` and
+then read back one row at a time as the background for every radar row, so it
+costs a file handle rather than a framebuffer; basemaps cut for a previous
+location are deleted. If the download fails the radar still renders, just over
+a flat background. A crosshair marks the configured location, and the status
+line carries the `RainViewer / OSM / CARTO` attribution.
 
 Heap headroom is logged around both phases (`heap[before download]`,
 `heap[before decode]`, `heap[after decode]`), and `sdkconfig.defaults` enables

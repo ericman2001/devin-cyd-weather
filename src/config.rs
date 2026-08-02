@@ -56,6 +56,16 @@ pub const RADAR_ZOOM: u8 = 6;
 /// RainViewer colour scheme id (4 = "Universal Blue").
 pub const RADAR_COLOR_SCHEME: u8 = 4;
 
+/// Basemap tile drawn underneath the radar so the precipitation has
+/// recognisable coastlines, roads and place labels behind it. `{z}`/`{x}`/`{y}`
+/// are substituted with the same slippy-map coordinates as the radar tile.
+/// CARTO's dark basemap, rendered from OpenStreetMap data (attribution is shown
+/// on the radar screen).
+pub const BASEMAP_TILE_URL: &str = "https://basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png";
+
+/// Attribution for the radar and basemap tiles, shown on the radar screen.
+pub const RADAR_ATTRIBUTION: &str = "RainViewer / OSM / CARTO";
+
 /// Number of radar frames staged on the SD card and animated.
 pub const RADAR_FRAME_COUNT: usize = 6;
 

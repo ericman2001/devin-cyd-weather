@@ -31,8 +31,9 @@ use embedded_graphics::pixelcolor::Rgb565;
 use serde::Deserialize;
 
 use crate::config::{
-    RADAR_COLOR_SCHEME, RADAR_FRAME_COUNT, RADAR_TILE_MAX_BYTES, RADAR_VIEW_HEIGHT,
-    RADAR_VIEW_WIDTH, RADAR_ZOOM, RAINVIEWER_INDEX_API, RAINVIEWER_INDEX_MAX_BYTES,
+    BASEMAP_TILE_URL, RADAR_COLOR_SCHEME, RADAR_FRAME_COUNT, RADAR_TILE_MAX_BYTES,
+    RADAR_VIEW_HEIGHT, RADAR_VIEW_WIDTH, RADAR_ZOOM, RAINVIEWER_INDEX_API,
+    RAINVIEWER_INDEX_MAX_BYTES,
 };
 use crate::display::CydDisplay;
 use crate::png_stream::{self, Row, RowSink};
@@ -48,8 +49,13 @@ const HEADER_LEN: usize = 8;
 /// Radar tiles are always 256x256 pixels.
 const TILE_SIZE: u32 = 256;
 
-/// Background the (mostly transparent) radar tiles are composited onto.
+/// Background the (mostly transparent) radar tiles are composited onto where
+/// no basemap is staged.
 const RADAR_BG: (u8, u8, u8) = (8, 12, 20);
+
+/// Colour and half-length of the crosshair marking the viewer's position.
+const MARKER: (u8, u8, u8) = (255, 214, 0);
+const MARKER_ARM: u32 = 5;
 
 /// Rows pushed to the panel per `set_pixels` call when streaming a frame.
 const BLIT_ROWS: usize = 4;
@@ -67,6 +73,22 @@ pub fn frame_path(index: usize) -> PathBuf {
 fn tile_path(index: usize) -> PathBuf {
     storage::path(&format!("{FRAME_DIR}/tile_{index}.png"))
 }
+
+/// Path of the downloaded (still encoded) basemap tile.
+fn basemap_tile_path() -> PathBuf {
+    storage::path(&format!("{FRAME_DIR}/base.png"))
+}
+
+/// Path of the decoded basemap frame. The geometry is baked into the name so a
+/// staged basemap is only reused for the location and zoom it was cut for.
+fn basemap_frame_path(geom: &Geometry) -> PathBuf {
+    storage::path(&format!(
+        "{FRAME_DIR}/{BASEMAP_PREFIX}{}_{}_{}_{}_{}.rgb565",
+        geom.zoom, geom.tile_x, geom.tile_y, geom.crop_x, geom.crop_y
+    ))
+}
+
+const BASEMAP_PREFIX: &str = "base_";
 
 /// Log the heap headroom around the memory-hungry stages.
 fn log_heap(stage: &str) {
@@ -204,6 +226,13 @@ pub struct Geometry {
     pub crop_h: u32,
     pub out_w: u32,
     pub out_h: u32,
+    /// Tile the crop was taken from, for naming the cached basemap frame.
+    pub zoom: u8,
+    pub tile_x: u32,
+    pub tile_y: u32,
+    /// The viewer's position in output coordinates.
+    pub marker_x: u32,
+    pub marker_y: u32,
 }
 
 impl Geometry {
@@ -215,13 +244,20 @@ impl Geometry {
         let (fx, fy) = tile_position(lat, lon, zoom);
         let px = (fx.fract() * TILE_SIZE as f64) as u32;
         let py = (fy.fract() * TILE_SIZE as f64) as u32;
+        let crop_x = px.saturating_sub(out_w / 2).min(TILE_SIZE - out_w);
+        let crop_y = py.saturating_sub(out_h / 2).min(TILE_SIZE - out_h);
         Self {
-            crop_x: px.saturating_sub(out_w / 2).min(TILE_SIZE - out_w),
-            crop_y: py.saturating_sub(out_h / 2).min(TILE_SIZE - out_h),
+            crop_x,
+            crop_y,
             crop_w: out_w,
             crop_h: out_h,
             out_w,
             out_h,
+            zoom,
+            tile_x: fx.floor().max(0.0) as u32,
+            tile_y: fy.floor().max(0.0) as u32,
+            marker_x: px.saturating_sub(crop_x).min(out_w - 1),
+            marker_y: py.saturating_sub(crop_y).min(out_h - 1),
         }
     }
 }
@@ -234,7 +270,13 @@ impl Geometry {
 ///
 /// The image is processed one scanline at a time and the inflate window lives
 /// in static memory, so peak heap is two source rows plus one output row.
-pub fn decode_to_frame(src: &Path, dst: &Path, geom: &Geometry) -> Result<()> {
+pub fn decode_to_frame(
+    src: &Path,
+    dst: &Path,
+    geom: &Geometry,
+    base: Option<BufReader<File>>,
+    marker: bool,
+) -> Result<()> {
     let file = File::open(src).with_context(|| format!("failed to open {}", src.display()))?;
 
     let mut out = BufWriter::with_capacity(
@@ -243,11 +285,20 @@ pub fn decode_to_frame(src: &Path, dst: &Path, geom: &Geometry) -> Result<()> {
     );
     write_header(&mut out, geom.out_w as u16, geom.out_h as u16)?;
 
+    let mut base_row = vec![0u8; geom.out_w as usize * 2];
+    let flat = rgb565(RADAR_BG.0, RADAR_BG.1, RADAR_BG.2).to_le_bytes();
+    for px in base_row.chunks_exact_mut(2) {
+        px.copy_from_slice(&flat);
+    }
+
     let mut sink = FrameSink {
         out: &mut out,
         geom,
         row_out: vec![0u8; geom.out_w as usize * 2],
         out_y: 0,
+        base,
+        base_row,
+        marker,
     };
     png_stream::decode(BufReader::with_capacity(512, file), &mut sink)
         .with_context(|| format!("failed to decode {}", src.display()))?;
@@ -272,6 +323,13 @@ struct FrameSink<'a, W: Write> {
     geom: &'a Geometry,
     row_out: Vec<u8>,
     out_y: u32,
+    /// Staged basemap frame, positioned just past its header, read one row at a
+    /// time so the radar can be composited over coastlines and place labels.
+    base: Option<BufReader<File>>,
+    /// The current basemap row, or a flat background when there is no basemap.
+    base_row: Vec<u8>,
+    /// Whether to draw the viewer's crosshair over the finished rows.
+    marker: bool,
 }
 
 impl<W: Write> RowSink for FrameSink<'_, W> {
@@ -294,13 +352,31 @@ impl<W: Write> RowSink for FrameSink<'_, W> {
         // maps onto the source row we are currently holding.
         let g = self.geom;
         while self.out_y < g.out_h && g.crop_y + self.out_y * g.crop_h / g.out_h == y {
-            convert_row(row, g, &mut self.row_out);
+            self.load_base_row();
+            convert_row(row, g, &self.base_row, &mut self.row_out);
+            if self.marker {
+                draw_marker(&mut self.row_out, self.out_y, g);
+            }
             self.out
                 .write_all(&self.row_out)
                 .context("failed to write a frame row")?;
             self.out_y += 1;
         }
         Ok(self.out_y < g.out_h)
+    }
+}
+
+impl<W: Write> FrameSink<'_, W> {
+    /// Pull the next basemap row. A short or unreadable basemap simply drops
+    /// back to the flat background already in `base_row`.
+    fn load_base_row(&mut self) {
+        let Some(base) = self.base.as_mut() else {
+            return;
+        };
+        if let Err(e) = base.read_exact(&mut self.base_row) {
+            log::warn!("basemap row {} unreadable: {e:#}", self.out_y);
+            self.base = None;
+        }
     }
 }
 
@@ -313,17 +389,32 @@ fn write_header<W: Write>(out: &mut W, width: u16, height: u16) -> Result<()> {
         .context("failed to write the frame header")
 }
 
-/// Convert one decoded source scanline into a horizontally resampled Rgb565 row.
-fn convert_row(src: &Row, geom: &Geometry, dst: &mut [u8]) {
+/// Convert one decoded source scanline into a horizontally resampled Rgb565
+/// row, compositing it over the matching `base` row.
+fn convert_row(src: &Row, geom: &Geometry, base: &[u8], dst: &mut [u8]) {
     for out_x in 0..geom.out_w as usize {
         let src_x = geom.crop_x as usize + out_x * geom.crop_w as usize / geom.out_w as usize;
         let (r, g, b, a) = src.pixel(src_x);
-        let raw = rgb565(
-            blend(r, a, RADAR_BG.0),
-            blend(g, a, RADAR_BG.1),
-            blend(b, a, RADAR_BG.2),
-        );
+        let (br, bg, bb) = unpack565(u16::from_le_bytes([base[out_x * 2], base[out_x * 2 + 1]]));
+        let raw = rgb565(blend(r, a, br), blend(g, a, bg), blend(b, a, bb));
         dst[out_x * 2..out_x * 2 + 2].copy_from_slice(&raw.to_le_bytes());
+    }
+}
+
+/// Stamp the viewer's crosshair into an output row.
+fn draw_marker(dst: &mut [u8], y: u32, geom: &Geometry) {
+    let raw = rgb565(MARKER.0, MARKER.1, MARKER.2).to_le_bytes();
+    let mut put = |x: u32| {
+        if x < geom.out_w {
+            dst[x as usize * 2..x as usize * 2 + 2].copy_from_slice(&raw);
+        }
+    };
+    if y == geom.marker_y {
+        for x in geom.marker_x.saturating_sub(MARKER_ARM)..=geom.marker_x + MARKER_ARM {
+            put(x);
+        }
+    } else if y.abs_diff(geom.marker_y) <= MARKER_ARM {
+        put(geom.marker_x);
     }
 }
 
@@ -336,6 +427,14 @@ fn blend(value: u8, alpha: u8, background: u8) -> u8 {
 
 fn rgb565(r: u8, g: u8, b: u8) -> u16 {
     ((r as u16 & 0xF8) << 8) | ((g as u16 & 0xFC) << 3) | (b as u16 >> 3)
+}
+
+fn unpack565(raw: u16) -> (u8, u8, u8) {
+    (
+        ((raw >> 8) & 0xF8) as u8,
+        ((raw >> 3) & 0xFC) as u8,
+        ((raw << 3) & 0xF8) as u8,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -366,7 +465,26 @@ pub fn download_tiles(source: &dyn RadarSource, lat: f64, lon: f64) -> Result<us
         bail!("no radar tiles could be downloaded");
     }
     log::info!("downloaded {staged} radar tiles to the SD card");
+
+    // The basemap never changes, so it is only fetched when the cached frame
+    // for this location is missing. Its absence only costs the labels.
+    if let Err(e) = download_basemap(lat, lon) {
+        log::warn!("basemap unavailable: {e:#}");
+    }
     Ok(staged)
+}
+
+/// Download the basemap tile for `lat`/`lon` unless its frame is already staged.
+fn download_basemap(lat: f64, lon: f64) -> Result<()> {
+    let geom = Geometry::centered_on(lat, lon, RADAR_ZOOM);
+    if basemap_frame_path(&geom).is_file() {
+        return Ok(());
+    }
+    let url = BASEMAP_TILE_URL
+        .replace("{z}", &geom.zoom.to_string())
+        .replace("{x}", &geom.tile_x.to_string())
+        .replace("{y}", &geom.tile_y.to_string());
+    download_tile(&url, &basemap_tile_path())
 }
 
 fn download_tile(url: &str, path: &Path) -> Result<()> {
@@ -376,16 +494,56 @@ fn download_tile(url: &str, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Decode the downloaded basemap tile (if any) into its cached frame and
+/// discard basemaps cut for a different location.
+fn prepare_basemap(geom: &Geometry) {
+    let frame = basemap_frame_path(geom);
+    let tile = basemap_tile_path();
+    if tile.is_file() {
+        // The basemap is opaque, so it composites over the flat background.
+        match decode_to_frame(&tile, &frame, geom, None, false) {
+            Ok(()) => log::info!("staged the radar basemap"),
+            Err(e) => log::warn!("decoding the basemap failed: {e:#}"),
+        }
+        let _ = std::fs::remove_file(&tile);
+    }
+
+    // Basemaps cut for a previous location are dead weight on the card.
+    if let Ok(entries) = std::fs::read_dir(storage::path(FRAME_DIR)) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let stale = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(BASEMAP_PREFIX))
+                && path != frame;
+            if stale {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+}
+
+/// Open the cached basemap frame, positioned at its first pixel row.
+fn open_basemap(geom: &Geometry) -> Option<BufReader<File>> {
+    let path = basemap_frame_path(geom);
+    let mut reader = BufReader::with_capacity(512, File::open(&path).ok()?);
+    let mut header = [0u8; HEADER_LEN];
+    reader.read_exact(&mut header).ok()?;
+    (header[..4] == MAGIC).then_some(reader)
+}
+
 /// Phase 2: decode the `count` staged tiles into compact `frame_{i}.rgb565`
 /// files and delete the encoded originals.
 pub fn decode_tiles(count: usize, lat: f64, lon: f64) -> Result<usize> {
     log_heap("before decode");
     let geom = Geometry::centered_on(lat, lon, RADAR_ZOOM);
+    prepare_basemap(&geom);
 
     let mut staged = 0usize;
     for i in 0..count {
         let tile = tile_path(i);
-        match decode_to_frame(&tile, &frame_path(staged), &geom) {
+        match decode_to_frame(&tile, &frame_path(staged), &geom, open_basemap(&geom), true) {
             Ok(()) => staged += 1,
             Err(e) => log::warn!("decoding {} failed: {e:#}", tile.display()),
         }

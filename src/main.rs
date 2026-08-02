@@ -32,8 +32,8 @@ use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 
 use crate::config::{
-    ConfigStore, StoredConfig, BACKLIGHT_ON_SECS, RADAR_FRAME_MS, RADAR_REFRESH_SECS,
-    REFRESH_INTERVAL_SECS, RETRY_INTERVAL_SECS,
+    ConfigStore, StoredConfig, BACKLIGHT_ON_SECS, RADAR_ATTRIBUTION, RADAR_FRAME_MS,
+    RADAR_REFRESH_SECS, REFRESH_INTERVAL_SECS, RETRY_INTERVAL_SECS,
 };
 use crate::display::{Backlight, CydDisplay};
 use crate::location::Location;
@@ -410,7 +410,11 @@ fn show_radar_frame(disp: &mut CydDisplay, state: &mut AppState) {
         state.radar.frames = 0;
         return;
     }
-    let label = format!("Frame {}/{}", index + 1, state.radar.frames);
+    let label = format!(
+        "Frame {}/{}  {RADAR_ATTRIBUTION}",
+        index + 1,
+        state.radar.frames
+    );
     ui::draw_radar_status(disp, &label).ok();
 }
 
