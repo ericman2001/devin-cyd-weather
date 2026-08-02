@@ -24,14 +24,11 @@ CONFIG_ESP_TLS_INSECURE=n
 CONFIG_FATFS_LFN_STACK=y
 CONFIG_FATFS_MAX_LFN=64
 
-# Heap headroom for the radar PNG decoder, which needs a 32 KB contiguous
-# block for its zlib window. mbedTLS otherwise keeps its ~32 KB of TLS I/O
-# buffers allocated for the lifetime of a connection, and the Wi-Fi driver
-# holds the rest of the large blocks.
+# Free the ~32 KB of mbedTLS I/O buffers between handshakes instead of holding
+# them for the lifetime of a connection. The radar decoder no longer needs a
+# large contiguous block, but downloading a frame's worth of tiles opens many
+# short-lived TLS sessions, so the stock Wi-Fi buffer pools are left untouched.
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
-CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
-CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
-CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
 
 # Power management: let the CPU idle at reduced power during the long waits
 # between refreshes. The firmware already yields via vTaskDelay, but without
