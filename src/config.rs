@@ -81,17 +81,23 @@ pub const HRRR_META_URL: &str =
 /// Cap on the HRRR metadata JSON we buffer in RAM.
 pub const HRRR_META_MAX_BYTES: usize = 1024;
 
-/// How far ahead the forecast frames run, and the step between them. HRRR is
-/// published on a 15-minute grid, so the step should stay a multiple of 15.
-pub const RADAR_FORECAST_MINUTES: i64 = 30;
+/// Step between forecast frames. HRRR is published on a 15-minute grid, so
+/// this should stay a multiple of 15.
 pub const RADAR_FORECAST_STEP_MINUTES: i64 = 15;
 
-/// Number of observed (RainViewer) frames shown before the forecast ones.
+/// Default forecast horizon; user-adjustable on the settings screen.
+pub const RADAR_FORECAST_MINUTES_DEFAULT: u16 = 30;
+
+/// Forecast horizons offered on the settings screen, in minutes (0 = past
+/// frames only).
+pub const RADAR_FORECAST_CHOICES: [u16; 5] = [0, 15, 30, 60, 90];
+
+/// Number of past frames shown before the forecast ones.
 pub const RADAR_PAST_FRAME_COUNT: usize = 4;
 
-/// Number of radar frames staged on the SD card and animated.
-pub const RADAR_FRAME_COUNT: usize =
-    RADAR_PAST_FRAME_COUNT + (RADAR_FORECAST_MINUTES / RADAR_FORECAST_STEP_MINUTES) as usize;
+/// Upper bound on the frames staged on the SD card, so the forecast horizon
+/// cannot grow the download unboundedly.
+pub const RADAR_MAX_FRAMES: usize = 10;
 
 /// Size of the radar view area on the panel, in pixels.
 pub const RADAR_VIEW_WIDTH: u16 = 240;
@@ -112,6 +118,8 @@ const KEY_AUTH: &str = "auth";
 const KEY_DEBUG: &str = "debug";
 const KEY_LAT: &str = "lat";
 const KEY_LON: &str = "lon";
+const KEY_FORECAST: &str = "fcstmin";
+const KEY_MODEL_PAST: &str = "mdlpast";
 
 // ---------------------------------------------------------------------------
 // Wi-Fi security / authentication method
@@ -208,6 +216,12 @@ pub struct StoredConfig {
     /// Optional manual latitude/longitude override. When present it takes
     /// precedence over IP-based geolocation.
     pub manual_location: Option<(f64, f64)>,
+    /// How far ahead the radar animation forecasts, in minutes.
+    pub radar_forecast_minutes: u16,
+    /// Draw the past half of the animation from the HRRR model too, so the
+    /// whole loop shares one source and colour ramp, instead of using measured
+    /// RainViewer radar.
+    pub radar_model_past: bool,
 }
 
 impl Default for StoredConfig {
@@ -218,6 +232,8 @@ impl Default for StoredConfig {
             auth_method: WifiAuth::default(),
             serial_debug: true,
             manual_location: None,
+            radar_forecast_minutes: RADAR_FORECAST_MINUTES_DEFAULT,
+            radar_model_past: false,
         }
     }
 }
@@ -275,12 +291,22 @@ impl ConfigStore {
             (Some(la), Some(lo)) => Some((la, lo)),
             _ => None,
         };
+        let radar_forecast_minutes = self
+            .get_string(KEY_FORECAST)?
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(RADAR_FORECAST_MINUTES_DEFAULT);
+        let radar_model_past = self
+            .get_string(KEY_MODEL_PAST)?
+            .map(|s| matches!(s.as_str(), "1" | "true"))
+            .unwrap_or(false);
         Ok(StoredConfig {
             ssid,
             password,
             auth_method,
             serial_debug,
             manual_location,
+            radar_forecast_minutes,
+            radar_model_past,
         })
     }
 
@@ -298,6 +324,12 @@ impl ConfigStore {
         self.nvs
             .set_str(KEY_DEBUG, if cfg.serial_debug { "1" } else { "0" })
             .context("failed to write debug flag")?;
+        self.nvs
+            .set_str(KEY_FORECAST, &cfg.radar_forecast_minutes.to_string())
+            .context("failed to write the radar forecast horizon")?;
+        self.nvs
+            .set_str(KEY_MODEL_PAST, if cfg.radar_model_past { "1" } else { "0" })
+            .context("failed to write the radar past-frame source")?;
         match cfg.manual_location {
             Some((lat, lon)) => {
                 self.nvs.set_str(KEY_LAT, &lat.to_string())?;
@@ -320,6 +352,8 @@ impl ConfigStore {
             KEY_DEBUG,
             KEY_LAT,
             KEY_LON,
+            KEY_FORECAST,
+            KEY_MODEL_PAST,
         ] {
             let _ = self.nvs.remove(key);
         }

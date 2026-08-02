@@ -75,17 +75,7 @@ impl<'a> Provisioner<'a> {
             "Enable",
             "Disable",
         )?;
-        let manual_location =
-            if self.confirm("Location", "Set manual lat/long?", "Yes", "No, use IP")? {
-                let lat = self.enter_text("Latitude (e.g. 30.27)", Keyboard::Numeric)?;
-                let lon = self.enter_text("Longitude (e.g. -97.74)", Keyboard::Numeric)?;
-                match (lat.trim().parse::<f64>(), lon.trim().parse::<f64>()) {
-                    (Ok(la), Ok(lo)) => Some((la, lo)),
-                    _ => None,
-                }
-            } else {
-                None
-            };
+        let manual_location = self.edit_location()?;
 
         Ok(StoredConfig {
             ssid: Some(ssid),
@@ -93,7 +83,24 @@ impl<'a> Provisioner<'a> {
             auth_method,
             serial_debug,
             manual_location,
+            ..StoredConfig::default()
         })
+    }
+
+    /// Ask whether to use IP geolocation or a manually entered lat/long,
+    /// returning the manual coordinates when one is given.
+    pub fn edit_location(&mut self) -> Result<Option<(f64, f64)>> {
+        if !self.confirm("Location", "Set manual lat/long?", "Yes", "No, use IP")? {
+            return Ok(None);
+        }
+        let lat = self.enter_text("Latitude (e.g. 30.27)", Keyboard::Numeric)?;
+        let lon = self.enter_text("Longitude (e.g. -97.74)", Keyboard::Numeric)?;
+        Ok(
+            match (lat.trim().parse::<f64>(), lon.trim().parse::<f64>()) {
+                (Ok(la), Ok(lo)) => Some((la, lo)),
+                _ => None,
+            },
+        )
     }
 
     // -- Input primitives ---------------------------------------------------

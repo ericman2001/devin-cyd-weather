@@ -36,7 +36,7 @@ use serde::Deserialize;
 use crate::clock;
 use crate::config::{
     BASEMAP_TILE_URL, HRRR_META_MAX_BYTES, HRRR_META_URL, HRRR_TILE_URL, RADAR_COLOR_SCHEME,
-    RADAR_FORECAST_MINUTES, RADAR_FORECAST_STEP_MINUTES, RADAR_FRAME_COUNT, RADAR_TILE_MAX_BYTES,
+    RADAR_FORECAST_STEP_MINUTES, RADAR_MAX_FRAMES, RADAR_PAST_FRAME_COUNT, RADAR_TILE_MAX_BYTES,
     RADAR_VIEW_HEIGHT, RADAR_VIEW_WIDTH, RADAR_ZOOM, RAINVIEWER_INDEX_API,
     RAINVIEWER_INDEX_MAX_BYTES,
 };
@@ -158,7 +158,7 @@ fn heap_stats() -> (u32, usize) {
 
 /// Number of frames currently staged on the SD card.
 pub fn staged_frames() -> usize {
-    (0..RADAR_FRAME_COUNT)
+    (0..RADAR_MAX_FRAMES)
         .take_while(|i| frame_path(*i).is_file())
         .count()
 }
@@ -252,10 +252,14 @@ impl RadarSource for RainViewer {
     }
 }
 
-/// Forecast radar: NCEP HRRR simulated reflectivity, rendered as slippy-map
-/// tiles by the Iowa Environmental Mesonet. Only covers CONUS.
+/// Model radar: NCEP HRRR simulated reflectivity, rendered as slippy-map tiles
+/// by the Iowa Environmental Mesonet. Only covers CONUS.
+///
+/// A single run publishes every 15 minutes from its initialisation out to 18
+/// hours, so it can supply frames on both sides of "now" -- although the ones
+/// before now are still model output rather than a measurement.
 #[derive(Default)]
-pub struct HrrrForecast;
+pub struct Hrrr;
 
 #[derive(Deserialize)]
 struct HrrrMeta {
@@ -267,8 +271,10 @@ struct HrrrMeta {
 /// Longest forecast the IEM publishes, in minutes.
 const HRRR_MAX_MINUTE: i64 = 1080;
 
-impl RadarSource for HrrrForecast {
-    fn frames(&self, max_frames: usize) -> Result<Vec<FrameSpec>> {
+impl Hrrr {
+    /// Frames on the model's 15-minute grid, from `past_frames` steps before
+    /// now through `forecast_minutes` after it.
+    fn window(&self, past_frames: usize, forecast_minutes: i64) -> Result<Vec<FrameSpec>> {
         let now = clock::now_unix().context("the clock is not synchronised")?;
         let body = crate::http::get(HRRR_META_URL, HRRR_META_MAX_BYTES)
             .context("failed to fetch the HRRR run metadata")?;
@@ -283,9 +289,10 @@ impl RadarSource for HrrrForecast {
             .collect();
 
         let step = RADAR_FORECAST_STEP_MINUTES * 60;
+        let last = forecast_minutes / RADAR_FORECAST_STEP_MINUTES;
         let mut frames = Vec::new();
-        for k in 1..=max_frames as i64 {
-            // Snap onto the model's 15-minute grid, always ahead of now.
+        for k in -(past_frames as i64)..=last {
+            // Snap onto the model's own 15-minute grid.
             let valid = (now / step + k) * step;
             let minute = (valid - init) / 60;
             if !(0..=HRRR_MAX_MINUTE).contains(&minute) {
@@ -297,13 +304,13 @@ impl RadarSource for HrrrForecast {
                     .replace("{init}", &run),
                 time: FrameTime {
                     time: valid,
-                    forecast: true,
+                    forecast: valid > now,
                 },
             });
         }
 
         if frames.is_empty() {
-            bail!("the HRRR run from {} is too old to forecast from", run);
+            bail!("the HRRR run from {run} covers none of the requested times");
         }
         Ok(frames)
     }
@@ -338,27 +345,57 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-/// The bundled pipeline: observed RainViewer frames followed by HRRR forecast
-/// frames, so the animation runs from the recent past into the near future.
-#[derive(Default)]
-pub struct ObservedThenForecast {
-    pub observed: RainViewer,
-    pub forecast: HrrrForecast,
+/// The bundled pipeline, running from the recent past into the near future.
+///
+/// The forecast half always comes from the HRRR model; the past half is
+/// measured RainViewer radar unless `model_past` asks for HRRR there too, which
+/// costs accuracy but keeps one colour ramp across the whole animation.
+pub struct Pipeline {
+    observed: RainViewer,
+    model: Hrrr,
+    past_frames: usize,
+    forecast_minutes: i64,
+    model_past: bool,
 }
 
-impl RadarSource for ObservedThenForecast {
+impl Pipeline {
+    pub fn new(forecast_minutes: u16, model_past: bool) -> Self {
+        Self {
+            observed: RainViewer::default(),
+            model: Hrrr,
+            past_frames: RADAR_PAST_FRAME_COUNT,
+            forecast_minutes: forecast_minutes as i64,
+            model_past,
+        }
+    }
+
+    /// Upper bound on the frames this pipeline can stage.
+    pub fn frame_budget(&self) -> usize {
+        let forecast = (self.forecast_minutes / RADAR_FORECAST_STEP_MINUTES) as usize;
+        (self.past_frames + forecast).min(RADAR_MAX_FRAMES)
+    }
+}
+
+impl RadarSource for Pipeline {
     fn frames(&self, max_frames: usize) -> Result<Vec<FrameSpec>> {
-        let wanted = (RADAR_FORECAST_MINUTES / RADAR_FORECAST_STEP_MINUTES) as usize;
-        let mut frames = match self.observed.frames(max_frames.saturating_sub(wanted)) {
+        if self.model_past {
+            return self.model.window(self.past_frames, self.forecast_minutes);
+        }
+
+        let forecast_wanted = max_frames.saturating_sub(self.past_frames);
+        let mut frames = match self.observed.frames(self.past_frames.min(max_frames)) {
             Ok(frames) => frames,
             Err(e) => {
                 log::warn!("observed radar unavailable: {e:#}");
                 Vec::new()
             }
         };
-        match self.forecast.frames(wanted) {
-            Ok(forecast) => frames.extend(forecast),
-            Err(e) => log::warn!("forecast radar unavailable: {e:#}"),
+        if forecast_wanted > 0 && self.forecast_minutes > 0 {
+            match self.model.window(0, self.forecast_minutes) {
+                // `window` includes the frame for the current 15-minute slot.
+                Ok(forecast) => frames.extend(forecast.into_iter().take(forecast_wanted)),
+                Err(e) => log::warn!("forecast radar unavailable: {e:#}"),
+            }
         }
 
         if frames.is_empty() {
@@ -668,15 +705,20 @@ fn unpack565(raw: u16) -> (u8, u8, u8) {
 // Orchestration: fetch N frames onto the SD card
 // ---------------------------------------------------------------------------
 
-/// Phase 1 (network): download the tiles for up to [`RADAR_FRAME_COUNT`] radar
-/// frames covering `lat`/`lon`. Returns how many frames were staged.
-pub fn download_tiles(source: &dyn RadarSource, lat: f64, lon: f64) -> Result<usize> {
+/// Phase 1 (network): download the tiles for up to `max_frames` radar frames
+/// covering `lat`/`lon`. Returns how many frames were staged.
+pub fn download_tiles(
+    source: &dyn RadarSource,
+    max_frames: usize,
+    lat: f64,
+    lon: f64,
+) -> Result<usize> {
     storage::ensure_dir(FRAME_DIR)?;
     log_heap("before download");
 
     let view = View::centered_on(lat, lon, RADAR_ZOOM);
     let placements = view.tiles();
-    let frames = source.frames(RADAR_FRAME_COUNT)?;
+    let frames = source.frames(max_frames.min(RADAR_MAX_FRAMES))?;
 
     let mut times = Vec::with_capacity(frames.len());
     let mut staged = 0usize;
@@ -777,7 +819,7 @@ pub fn decode_tiles(count: usize, lat: f64, lon: f64) -> Result<usize> {
     }
 
     // Drop any stale frames left over from a longer previous run.
-    for i in staged..RADAR_FRAME_COUNT {
+    for i in staged..RADAR_MAX_FRAMES {
         let _ = std::fs::remove_file(frame_path(i));
     }
     write_times(&times);

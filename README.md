@@ -162,11 +162,27 @@ of the board; without one the firmware logs a warning, keeps working, and the
 radar screen reports that no card is present. The firmware never formats the
 card, so existing data is safe.
 
-Tap the bottom toolbar to switch between **Weather** and **Radar**. (When the
-backlight is off, the first tap only wakes the screen.) On the radar screen the
-staged frames cycle every 600 ms and are re-downloaded when older than 10
-minutes; the animation pauses whenever the backlight is off. The 30-minute
-weather refresh and the tap-activated backlight behave exactly as before.
+Tap the bottom toolbar to switch between **Weather**, **Radar** and the gear
+(**Settings**). (When the backlight is off, the first tap only wakes the
+screen.) On the radar screen the staged frames cycle every 600 ms and are
+re-downloaded when older than 10 minutes; the animation pauses whenever the
+backlight is off. The 30-minute weather refresh and the tap-activated backlight
+behave exactly as before.
+
+### Settings screen
+
+The gear tab lists four rows; tapping one acts on it immediately and persists
+the result to NVS:
+
+| Row | Effect |
+|-----|--------|
+| Location | Opens the auto/manual chooser and numeric keypad, then re-resolves the position |
+| Wi-Fi | Re-runs the provisioning flow (scan, password, security) and reconnects |
+| Radar forecast | Cycles the forecast horizon: off, 15, 30, 60 or 90 minutes |
+| Radar past frames | Switches the past half between measured RainViewer radar and HRRR model output |
+
+Changing any radar setting drops the staged frames so the next visit to the
+radar screen re-stages them.
 
 ### Memory-conscious streaming pipeline
 
@@ -206,14 +222,13 @@ data) — coastlines, roads and place labels. The basemap is composed once into
 radar frame, so it costs one file copy rather than a framebuffer; basemaps
 composed for a previous view are deleted. If the download fails the radar still
 renders, just over a flat background. A crosshair marks the configured
-location, and the status line carries the `RainViewer / OSM / CARTO`
+location, and the status line carries the `RainViewer/HRRR-IEM/OSM`
 attribution.
 
-Each frame's observation time (from the RainViewer index, recorded alongside
-the frames in `/sdcard/radar/times.txt`) is shown in the radar title, e.g.
-`Radar  7:15 PM`, with nowcast frames marked `fcst`. The board has no clock, so
-the timestamps are rendered in local time using the `utc_offset_seconds` the
-forecast API reports for your coordinates.
+Each frame's time (recorded alongside the frames in
+`/sdcard/radar/times.txt`) is shown in the radar title, e.g. `Radar  7:15 PM`,
+with forecast frames marked `fcst`. The times are rendered in local time using
+the `utc_offset_seconds` the forecast API reports for your coordinates.
 
 ### View geometry
 
@@ -243,19 +258,25 @@ comes from a different service:
   Mesonet](https://mesonet.agron.iastate.edu/GIS/model.phtml). Tiles are
   addressed by *forecast minute* relative to a model run, so the firmware reads
   the run's metadata JSON and works out which minutes correspond to the next
-  `RADAR_FORECAST_MINUTES` (default 30, in 15-minute steps). This is a model
+  `radar_forecast_minutes` (default 30, in 15-minute steps; adjustable on the
+  settings screen). This is a model
   prediction, not a measurement, and it covers **CONUS only** — elsewhere the
   forecast frames come back empty.
 
-Forecast frames therefore need to know the current time, which the board has no
+One HRRR run publishes frames on both sides of "now", so the settings screen
+can also drive the past half from the model (`Radar past frames: HRRR model`)
+for a single source and one colour ramp across the animation — at the cost of
+showing modelled rather than measured precipitation.
+
+Forecast frames need to know the current time, which the board has no
 RTC for: `src/clock.rs` starts SNTP after Wi-Fi comes up, and the forecast half
 is skipped (with the observed half still shown) if the clock never syncs.
 
 Open-Meteo serves no radar imagery, so sources are pluggable: implement
 `radar::RadarSource` (one method returning tile URL templates with `{z}`/`{x}`/
 `{y}`, oldest first) and pass it to `radar::download_tiles`. The bundled
-implementations are `radar::RainViewer`, `radar::HrrrForecast` and
-`radar::ObservedThenForecast`, which chains the two. Zoom level, colour scheme,
+implementations are `radar::RainViewer`, `radar::Hrrr` and `radar::Pipeline`,
+which chains the two according to the saved settings. Zoom level, colour scheme,
 frame counts, forecast horizon, dwell time and the refresh interval are
 constants in `src/config.rs`.
 
@@ -282,7 +303,7 @@ flags there.
 | `src/provisioning.rs` | Touch setup UI (list, keyboard, keypad) |
 | `src/location.rs` | IP geolocation |
 | `src/weather.rs` | Open-Meteo forecast + AQI, WMO code mapping |
-| `src/ui.rs` | Weather dashboard, radar chrome, toolbar, status/error rendering |
+| `src/ui.rs` | Weather dashboard, radar chrome, settings list, toolbar, status/error rendering |
 | `src/http.rs` | HTTPS GET helpers (buffered + streaming, mbedTLS cert bundle) |
 
 ## License

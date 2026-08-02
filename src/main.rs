@@ -33,12 +33,12 @@ use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 
 use crate::config::{
-    ConfigStore, StoredConfig, BACKLIGHT_ON_SECS, RADAR_ATTRIBUTION, RADAR_FRAME_MS,
-    RADAR_REFRESH_SECS, REFRESH_INTERVAL_SECS, RETRY_INTERVAL_SECS,
+    ConfigStore, StoredConfig, BACKLIGHT_ON_SECS, RADAR_ATTRIBUTION, RADAR_FORECAST_CHOICES,
+    RADAR_FRAME_MS, RADAR_REFRESH_SECS, REFRESH_INTERVAL_SECS, RETRY_INTERVAL_SECS,
 };
 use crate::display::{Backlight, CydDisplay};
 use crate::location::Location;
-use crate::radar::ObservedThenForecast;
+use crate::radar::Pipeline;
 use crate::touch::{Calibration, Touch};
 use crate::ui::Screen;
 use crate::weather::WeatherData;
@@ -171,7 +171,7 @@ fn main() -> Result<()> {
         backlight: &mut backlight,
         wifi: &mut wifi,
     };
-    run_refresh_loop(&mut devices, &mut cfg, location, sd_ready)
+    run_refresh_loop(&mut devices, &mut cfg, &mut store, location, sd_ready)
 }
 
 /// The peripherals the refresh loop and the screens share.
@@ -279,7 +279,7 @@ struct AppState {
 
 /// Radar slideshow bookkeeping.
 struct RadarState {
-    source: ObservedThenForecast,
+    source: Pipeline,
     /// False when no SD card is mounted; the radar screen then just says so.
     sd_ready: bool,
     frames: usize,
@@ -303,9 +303,18 @@ impl RadarState {
     }
 }
 
+/// Mutable state the screens share besides the peripherals: the settings and
+/// the location they resolve to.
+struct Session<'a> {
+    cfg: &'a mut StoredConfig,
+    store: &'a mut ConfigStore,
+    location: Location,
+}
+
 fn run_refresh_loop(
     dev: &mut Devices,
     cfg: &mut StoredConfig,
+    store: &mut ConfigStore,
     location: Location,
     sd_ready: bool,
 ) -> Result<()> {
@@ -321,7 +330,7 @@ fn run_refresh_loop(
         remaining_on_ms: 0,
         touch_down: false,
         radar: RadarState {
-            source: ObservedThenForecast::default(),
+            source: Pipeline::new(cfg.radar_forecast_minutes, cfg.radar_model_past),
             sd_ready,
             frames: 0,
             index: 0,
@@ -332,28 +341,41 @@ fn run_refresh_loop(
         },
     };
 
-    loop {
-        ensure_connected(dev.disp, dev.wifi, cfg);
+    let mut session = Session {
+        cfg,
+        store,
+        location,
+    };
 
-        let sleep_secs = match weather::fetch(location.latitude, location.longitude) {
+    loop {
+        ensure_connected(dev.disp, dev.wifi, session.cfg);
+
+        let (lat, lon) = (session.location.latitude, session.location.longitude);
+        let sleep_secs = match weather::fetch(lat, lon) {
             Ok(data) => {
                 state.radar.utc_offset = Some(data.utc_offset_seconds);
                 last_good = Some(data);
                 if state.screen == Screen::Weather {
-                    draw_weather_screen(dev.disp, last_good.as_ref(), &location, false);
+                    draw_weather_screen(dev.disp, last_good.as_ref(), &session.location, false);
                 }
                 REFRESH_INTERVAL_SECS
             }
             Err(e) => {
                 log::warn!("weather fetch failed: {e:#}");
                 if state.screen == Screen::Weather {
-                    draw_weather_screen(dev.disp, last_good.as_ref(), &location, true);
+                    draw_weather_screen(dev.disp, last_good.as_ref(), &session.location, true);
                 }
                 RETRY_INTERVAL_SECS
             }
         };
 
-        wait_with_backlight(dev, &mut state, last_good.as_ref(), &location, sleep_secs);
+        wait_with_backlight(
+            dev,
+            &mut state,
+            &mut session,
+            last_good.as_ref(),
+            sleep_secs,
+        );
     }
 }
 
@@ -419,7 +441,13 @@ fn enter_radar_screen(dev: &mut Devices, state: &mut AppState, location: &Locati
 
 /// Download the radar tiles, then decode them into displayable frames.
 fn refresh_radar(dev: &mut Devices, state: &mut AppState, location: &Location) -> Result<usize> {
-    let tiles = radar::download_tiles(&state.radar.source, location.latitude, location.longitude)?;
+    let budget = state.radar.source.frame_budget();
+    let tiles = radar::download_tiles(
+        &state.radar.source,
+        budget,
+        location.latitude,
+        location.longitude,
+    )?;
     ui::draw_radar_status(dev.disp, "Decoding...").ok();
     let frames = radar::decode_tiles(tiles, location.latitude, location.longitude)?;
     state.radar.times = radar::frame_times();
@@ -482,8 +510,8 @@ fn show_radar_frame(disp: &mut CydDisplay, state: &mut AppState) {
 fn wait_with_backlight(
     dev: &mut Devices,
     state: &mut AppState,
+    session: &mut Session,
     last_good: Option<&WeatherData>,
-    location: &Location,
     total_secs: u64,
 ) {
     const CHUNK_MS: u64 = 100;
@@ -508,12 +536,12 @@ fn wait_with_backlight(
             } else if let Some(target) = ui::toolbar_hit(p) {
                 if target != state.screen {
                     state.screen = target;
-                    match target {
-                        Screen::Weather => {
-                            draw_weather_screen(dev.disp, last_good, location, false)
-                        }
-                        Screen::Radar => enter_radar_screen(dev, state, location),
-                    }
+                    show_screen(dev, state, session, last_good);
+                }
+            } else if state.screen == Screen::Settings {
+                if let Some(row) = ui::settings_row_hit(p, SETTINGS_ROWS) {
+                    apply_setting(dev, state, session, row);
+                    draw_settings_screen(dev.disp, session);
                 }
             }
         }
@@ -539,6 +567,135 @@ fn wait_with_backlight(
 
         sleep_remaining_ms = sleep_remaining_ms.saturating_sub(CHUNK_MS);
     }
+}
+
+/// Draw whichever screen is currently selected.
+fn show_screen(
+    dev: &mut Devices,
+    state: &mut AppState,
+    session: &mut Session,
+    last_good: Option<&WeatherData>,
+) {
+    match state.screen {
+        Screen::Weather => draw_weather_screen(dev.disp, last_good, &session.location, false),
+        Screen::Radar => enter_radar_screen(dev, state, &session.location),
+        Screen::Settings => draw_settings_screen(dev.disp, session),
+    }
+}
+
+// -- Settings screen --------------------------------------------------------
+
+const SETTINGS_ROWS: usize = 4;
+
+/// Render the settings list from the current configuration.
+fn draw_settings_screen(disp: &mut CydDisplay, session: &Session) {
+    let cfg = &session.cfg;
+    let location = match cfg.manual_location {
+        Some((lat, lon)) => format!("{lat:.2}, {lon:.2}"),
+        None => format!(
+            "Auto: {:.2}, {:.2}",
+            session.location.latitude, session.location.longitude
+        ),
+    };
+    let wifi = cfg.ssid.clone().unwrap_or_else(|| "Not set".to_string());
+    let forecast = match cfg.radar_forecast_minutes {
+        0 => "Off (past only)".to_string(),
+        minutes => format!("{minutes} min ahead"),
+    };
+    let past = if cfg.radar_model_past {
+        "HRRR model"
+    } else {
+        "Measured radar"
+    };
+
+    let rows = [
+        ui::SettingsRow {
+            label: "Location (tap to change)",
+            value: &location,
+        },
+        ui::SettingsRow {
+            label: "Wi-Fi (tap to reconfigure)",
+            value: &wifi,
+        },
+        ui::SettingsRow {
+            label: "Radar forecast",
+            value: &forecast,
+        },
+        ui::SettingsRow {
+            label: "Radar past frames",
+            value: past,
+        },
+    ];
+    ui::draw_settings(disp, &rows).ok();
+    ui::draw_toolbar(disp, Screen::Settings).ok();
+}
+
+/// Act on a tapped settings row, persisting the result.
+fn apply_setting(dev: &mut Devices, state: &mut AppState, session: &mut Session, row: usize) {
+    match row {
+        0 => {
+            let picked = provisioning::Provisioner::new(dev.disp, dev.touch)
+                .edit_location()
+                .unwrap_or(session.cfg.manual_location);
+            session.cfg.manual_location = picked;
+            session.location = resolve_location(dev.disp, session.cfg);
+            invalidate_radar(state);
+        }
+        1 => {
+            match provision(dev.disp, dev.touch, dev.wifi, session.store) {
+                Ok(cfg) => {
+                    // The provisioning flow does not ask about the radar, so
+                    // those preferences carry over.
+                    *session.cfg = StoredConfig {
+                        radar_forecast_minutes: session.cfg.radar_forecast_minutes,
+                        radar_model_past: session.cfg.radar_model_past,
+                        ..cfg
+                    };
+                    if let Err(e) = session.store.save(session.cfg) {
+                        log::warn!("failed to persist settings: {e:#}");
+                    }
+                    apply_log_level(session.cfg.serial_debug);
+                    session.location = resolve_location(dev.disp, session.cfg);
+                }
+                Err(e) => log::warn!("Wi-Fi reconfiguration failed: {e:#}"),
+            }
+            ensure_connected(dev.disp, dev.wifi, session.cfg);
+            invalidate_radar(state);
+        }
+        2 => {
+            let current = session.cfg.radar_forecast_minutes;
+            let next = RADAR_FORECAST_CHOICES
+                .iter()
+                .position(|m| *m == current)
+                .map(|i| (i + 1) % RADAR_FORECAST_CHOICES.len())
+                .unwrap_or(0);
+            session.cfg.radar_forecast_minutes = RADAR_FORECAST_CHOICES[next];
+            rebuild_radar_source(state, session);
+        }
+        3 => {
+            session.cfg.radar_model_past = !session.cfg.radar_model_past;
+            rebuild_radar_source(state, session);
+        }
+        _ => return,
+    }
+
+    if let Err(e) = session.store.save(session.cfg) {
+        log::warn!("failed to persist settings: {e:#}");
+    }
+}
+
+/// Drop the staged frames so the next visit to the radar screen re-stages them.
+fn invalidate_radar(state: &mut AppState) {
+    state.radar.staged_at = None;
+    state.radar.frames = 0;
+}
+
+fn rebuild_radar_source(state: &mut AppState, session: &Session) {
+    state.radar.source = Pipeline::new(
+        session.cfg.radar_forecast_minutes,
+        session.cfg.radar_model_past,
+    );
+    invalidate_radar(state);
 }
 
 /// Reconnect if the link dropped between refreshes.
